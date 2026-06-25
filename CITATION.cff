@@ -1,7 +1,0 @@
-cff-version: 1.2.0
-title: Distributed-CC
-message: "If you use Distributed-CC, please cite the associated paper or repository."
-authors:
-  - name: The Distributed-CC Developers
-license: Apache-2.0
-version: 0.1.0-dev

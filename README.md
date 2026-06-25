@@ -9,9 +9,12 @@ It currently provides:
 - distributed perturbative [Q] and (Q) energy corrections
 - distributed RCCSDTQ
 
-The package follows the reference research implementation closely. It is
-intended for development, benchmarking, and validation before a stable public
-API is declared.
+The code is developed at the Initiative for Computational Catalysis at the Flatiron Institute.
+
+If you find this package useful for your scientific research, please cite the work as:
+
+ - Y. Jin, C. Hillenbrand, T. C. Berkelbach, and H. Zhai. High-performance parallel implementation of high-order coupled-cluster theories. *TBD*.
+
 
 ## Repository Layout
 
@@ -46,12 +49,6 @@ Create and activate a virtual environment, then install the package in editable 
 
 ```bash
 python -m pip install -e .
-```
-
-To include the recommended performance dependency:
-
-```bash
-python -m pip install -e ".[recommended]"
 ```
 
 ## Native Build
@@ -139,8 +136,3 @@ export DISTR_CC_ALLOW_PYTHON_FALLBACK=1
 ```
 
 or set `allow_python_fallback = True` on the relevant driver object.
-
-## Citation
-
-If you use Distributed-CC, please cite the associated paper or repository. See
-`CITATION.cff` for citation metadata.
