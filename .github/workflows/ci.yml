@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    env:
+      PYTHONPYCACHEPREFIX: /tmp/distr_cc_pycache
+      PYSCF_VERSION: "2.13.1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install system MPI and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            libopenmpi-dev \
+            openmpi-bin
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pytest mpi4py "pyscf==${PYSCF_VERSION}"
+          python -m pip install -e . --no-deps
+
+      - name: Verify pinned PySCF
+        run: |
+          python - <<'PY'
+          import pyscf
+          assert pyscf.__version__ == "2.13.1", pyscf.__version__
+          print("PySCF", pyscf.__version__)
+          PY
+
+      - name: Build native shared library
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          test -f build/distr_cc.so
+          test "$(find build -maxdepth 1 -name '*.so' | wc -l)" -eq 1
+
+      - name: Run non-MPI tests
+        run: |
+          python -m pytest -q -m "not mpi" -o cache_dir=/tmp/distr_cc_pytest_cache
+
+      - name: Run MPI tests
+        run: |
+          mpirun --oversubscribe -n 2 python -m pytest -q -m mpi -o cache_dir=/tmp/distr_cc_pytest_cache_mpi
+          mpirun --oversubscribe -n 3 python -m pytest -q -m mpi -o cache_dir=/tmp/distr_cc_pytest_cache_mpi
+          mpirun --oversubscribe -n 4 python -m pytest -q -m mpi -o cache_dir=/tmp/distr_cc_pytest_cache_mpi

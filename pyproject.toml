@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Distributed-CC"
+version = "0.1.0.dev0"
+description = "Distributed high-order coupled-cluster methods"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [
+  {name = "The Distributed-CC Developers", email = "yjin@flatironinstitute.org"}
+]
+dependencies = [
+  "numpy",
+  "pyscf==2.13.1",
+  "mpi4py",
+]
+[project.optional-dependencies]
+recommended = [
+  "pytblis",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Chemistry",
+]
+
+[project.urls]
+Homepage = "https://github.com/jinyuchem/Distributed-CC"
+
+[tool.setuptools]
+packages = ["distr_cc"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "mpi: tests intended to be run under mpirun",
+]

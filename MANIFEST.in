@@ -1,0 +1,4 @@
+include LICENSE README.md NOTICE CITATION.cff CMakeLists.txt
+recursive-include src *.c
+recursive-include examples *.py
+recursive-include tests *.py

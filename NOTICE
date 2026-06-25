@@ -1,0 +1,7 @@
+distr_cc
+Copyright 2025-2026 The Distributed-CC Developers.
+
+This project includes code derived from PySCF high-order coupled-cluster
+implementations. PySCF is licensed under the Apache License, Version 2.0.
+Original PySCF attribution and author notices are retained in derived source
+files where applicable.
