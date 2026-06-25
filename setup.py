@@ -33,5 +33,5 @@ setup(
     url="https://github.com/jinyuchem/Distributed-CC",
     packages=["Distributed-CC"],
     python_requires=">=3.9",
-    install_requires=["numpy", "pyscf==2.13.1", "mpi4py", "pytblis"],
+    install_requires=["numpy", "pyscf>=2.13.1", "mpi4py"],
 )
