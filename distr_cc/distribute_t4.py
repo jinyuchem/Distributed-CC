@@ -813,12 +813,12 @@ class DistributedT4IJKL:
         if self.rank == 0:
             metadata = {
                 "kind": "DistributedT4IJKL",
-                "nocc": self.nocc,
-                "nvir": self.nvir,
-                "distribution": self.distribution,
-                "batch_size": self.batch_size,
+                "nocc": int(self.nocc),
+                "nvir": int(self.nvir),
+                "distribution": str(self.distribution),
+                "batch_size": None if self.batch_size is None else int(self.batch_size),
                 "dtype": self.dtype.str,
-                "size": self.size,
+                "size": int(self.size),
                 "zero_rule": "skip_i_eq_j_eq_k_or_j_eq_k_eq_l",
             }
             with open(f"{prefix}metadata.json", "w") as f:

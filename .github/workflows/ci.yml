@@ -15,7 +15,11 @@ jobs:
         python-version: ["3.9", "3.11", "3.12"]
 
     env:
-      PYTHONPYCACHEPREFIX: /tmp/distr_cc_pycache
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      PYTHONPYCACHEPREFIX: /tmp/distributed_cc_pycache
       PYSCF_VERSION: "2.13.1"
 
     steps:
@@ -58,12 +62,15 @@ jobs:
           test -f build/distr_cc.so
           test "$(find build -maxdepth 1 -name '*.so' | wc -l)" -eq 1
 
-      - name: Run non-MPI tests
+      - name: Run serial tests
         run: |
-          python -m pytest -q -m "not mpi" -o cache_dir=/tmp/distr_cc_pytest_cache
+          python -m pytest -q -o cache_dir=/tmp/distributed_cc_pytest_cache_serial
 
       - name: Run MPI tests
         run: |
-          mpirun --oversubscribe -n 2 python -m pytest -q -m mpi -o cache_dir=/tmp/distr_cc_pytest_cache_mpi
-          mpirun --oversubscribe -n 3 python -m pytest -q -m mpi -o cache_dir=/tmp/distr_cc_pytest_cache_mpi
-          mpirun --oversubscribe -n 4 python -m pytest -q -m mpi -o cache_dir=/tmp/distr_cc_pytest_cache_mpi
+          set -euo pipefail
+          for n in 2 3 4; do
+            mpirun --oversubscribe -n "$n" \
+              python -m pytest -q \
+              -o cache_dir="/tmp/distributed_cc_pytest_cache_mpi_${n}"
+          done

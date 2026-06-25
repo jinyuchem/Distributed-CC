@@ -891,12 +891,12 @@ class DistributedT3IJK:
         # Rank 0 saves scalar metadata as JSON
         if self.rank == 0:
             metadata = {
-                'nocc': self.nocc,
-                'nvir': self.nvir,
-                'distribution': self.distribution,
-                'batch_size': self.batch_size,
+                'nocc': int(self.nocc),
+                'nvir': int(self.nvir),
+                'distribution': str(self.distribution),
+                'batch_size': None if self.batch_size is None else int(self.batch_size),
                 'dtype': np.dtype(self.dtype).str,
-                'size': self.size,
+                'size': int(self.size),
             }
             meta_filename = f"{prefix}metadata.json"
             with open(meta_filename, 'w') as f:

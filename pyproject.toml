@@ -38,6 +38,3 @@ packages = ["distr_cc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-  "mpi: tests intended to be run under mpirun",
-]

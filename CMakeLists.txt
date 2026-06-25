@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(distr_cc LANGUAGES C CXX)
+project(Distributed-CC LANGUAGES C CXX)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
   message(FATAL_ERROR "Distributed-CC requires g++ version 10 or newer for the symmetrized tensor contraction implementation")
