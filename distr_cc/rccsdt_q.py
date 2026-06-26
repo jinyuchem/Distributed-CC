@@ -59,7 +59,18 @@ def prepare_t3_for_q(t3, comm=None, blksize=4, chunk_size=None):
         return t3
     return redistribute_t3_ijk_to_abc(dt3, t3_local, comm, blksize_abc=blksize, chunk_size=chunk_size)
 
-def prepare_tamps_for_q(mycc, tamps=None, blksize=4, comm=None, chunk_size=None):
+def _replace_t3_reference(tamps, old_t3, new_t3):
+    if tamps is None:
+        return False
+    try:
+        if len(tamps) > 2 and tamps[2] is old_t3:
+            tamps[2] = new_t3
+            return True
+    except (TypeError, AttributeError):
+        pass
+    return False
+
+def prepare_tamps_for_q(mycc, tamps=None, blksize=4, comm=None, chunk_size=None, release_ijk_t3=True):
     if tamps is None:
         tamps = mycc.tamps
     if len(tamps) < 3:
@@ -69,6 +80,14 @@ def prepare_tamps_for_q(mycc, tamps=None, blksize=4, comm=None, chunk_size=None)
     t1, t2, t3 = tamps[:3]
     t2_q = prepare_t2_for_q(mycc, t2)
     t3_q = prepare_t3_for_q(t3, comm=comm, blksize=blksize, chunk_size=chunk_size)
+    if release_ijk_t3 and t3_q is not t3:
+        replaced = _replace_t3_reference(tamps, t3, t3_q)
+        mycc_tamps = getattr(mycc, 'tamps', None)
+        if mycc_tamps is not tamps:
+            replaced = _replace_t3_reference(mycc_tamps, t3, t3_q) or replaced
+        t3 = None
+        if replaced:
+            gc.collect()
     return [t1, t2_q, t3_q]
 
 def memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, n_tasks=None, local_tasks=None, comm=None):
@@ -122,7 +141,7 @@ def memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, n_tasks=None, local_
     return mycc
 
 
-def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=1):
+def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=1, release_ijk_t3=True):
     '''Compute [Q] and (Q) correction terms using the ABC-based algorithm.
     Offsets and tasks are determined by job_idx/n_jobs for job splitting.'''
     time0 = logger.process_clock(), logger.perf_counter()
@@ -142,17 +161,9 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     memlog = memory_logger(mycc)
     warn_non_pytblis_backend(mycc, "RCCSDT(Q)")
     progress_thread = start_mpi_progress_thread(mycc)
-    comm_log = logger.Logger(
-        mycc.stdout,
-        logger.DEBUG if (rank == 0 and getattr(mycc, "log_highest_t_communication", False)) else 0,
-    )
-    detail_log = logger.Logger(
-        mycc.stdout,
-        logger.DEBUG1 if (
-            getattr(mycc, "log_highest_t_contractions", False)
-            and (rank == 0 or getattr(mycc, "log_highest_t_contractions_all_ranks", False))
-        ) else 0,
-    )
+    comm_log = logger.Logger(mycc.stdout, logger.DEBUG if (rank == 0 and getattr(mycc, "log_highest_t_communication", False)) else 0)
+    detail_log = logger.Logger(mycc.stdout, logger.DEBUG1 if (getattr(mycc, "log_highest_t_contractions", False)
+                            and (rank == 0 or getattr(mycc, "log_highest_t_contractions_all_ranks", False))) else 0)
 
     backend = mycc.einsum_backend
     einsum = functools.partial(_einsum, backend)
@@ -160,8 +171,10 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     nocc, nmo = mycc.nocc, mycc.nmo
     nvir = nmo - nocc
 
-    _, t2, t3 = prepare_tamps_for_q(mycc, tamps=tamps, blksize=blksize, comm=comm)
+    log_memory(mycc, memlog, 'RCCSDT(Q) Before T_IJK -> T_ABC')
+    _, t2, t3 = prepare_tamps_for_q(mycc, tamps=tamps, blksize=blksize, comm=comm, release_ijk_t3=release_ijk_t3)
     dt3, t3_local = t3
+    log_memory(mycc, memlog, 'RCCSDT(Q) After T_IJK -> T_ABC')
 
     mo_energy = eris.mo_energy
     e_occ = mo_energy[:nocc]
@@ -773,14 +786,12 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
             ptr_table.fill(0)
             if task_buffers:
                 indices = np.fromiter(task_buffers.keys(), dtype=np.int64, count=len(task_buffers))
-                addrs = np.fromiter((b.ctypes.data for b in task_buffers.values()), dtype=np.uint64,
-                                    count=len(task_buffers))
+                addrs = np.fromiter((b.ctypes.data for b in task_buffers.values()), dtype=np.uint64, count=len(task_buffers))
                 ptr_table[indices] = addrs
 
             # Helper to fill t3 using C
             def fill_t3_p2p(t3_blk_target, a0, a1, b0, b1, buffer_map):
-                fill_t3_from_ptr_array(t3_blk_target, a0, a1, b0, b1, nvir, nocc, ptr_table,
-                                        blksize, t3_blk_target.size, ptr_table.size)
+                fill_t3_from_ptr_array(t3_blk_target, a0, a1, b0, b1, nvir, nocc, ptr_table, blksize, t3_blk_target.size, ptr_table.size)
 
             (a0, a1, ba, b0, b1, bb, c0, c1, bc, d0, d1, bd) = task
             detail_log.debug(f"    Rank {rank} show task {ti+1}: a[{a0}:{a1}] b[{b0}:{b1}] c[{c0}:{c1}] d[{d0}:{d1}]")
