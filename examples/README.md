@@ -21,10 +21,14 @@ mpirun -n 4 python examples/02_restart.py
   RCCSDT from disk, and then running the perturbative `[Q]` and `(Q)`
   corrections.
 
+## Parameters and Flags
+
+See [`../docs/parameters.md`](../docs/parameters.md) for the RCCSDT,
+RCCSDT(Q), and RCCSDTQ parameter and logging flag reference.
+
 ## Production Examples
 
 Production-scale run scripts and parameter templates will live in
 `examples/production/`.  Those examples are intended to cover HPC job setup,
 Slurm scripts, recommended `pytblis` builds, restart layout, logging options,
 and parameter choices for long multi-node calculations.
-
