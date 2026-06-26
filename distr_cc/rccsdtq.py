@@ -864,7 +864,7 @@ def compute_r4_tri(mycc, imds, t2, t3, t4):
         einsum("ecdm,meab->abcd", W_oovvvo[k, l], t3_tmp[:, i, j], out=r4_tmp, alpha=0.5, beta=1.0)
 
         time2 = log.timer_debug1(contraction_message(mycc, "r4: iter: W_vvvo * t3, W_vooo * t3, "
-                                "W_oovvvo * t3 [%2d, %2d, %2d, %2d]: %s" % (i, j, k, l, time2)), *time2)
+                                "W_oovvvo * t3 [%2d, %2d, %2d, %2d]:" % (i, j, k, l)), *time2)
     W_vvvo = imds.W_vvvo = None
     W_vooo = imds.W_vooo = None
     W_oovvvo = imds.W_oovvvo = None

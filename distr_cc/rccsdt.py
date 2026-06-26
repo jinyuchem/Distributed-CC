@@ -27,7 +27,8 @@ from pyscf.cc import ccsd
 from pyscf.cc.rccsdt import (_einsum, t3_spin_summation_inplace_, update_t1_fock_eris, energy_rhf, intermediates_t1t2,
                             compute_r1r2, r1r2_divide_e_, intermediates_t3, amplitudes_to_vector_rhf,
                             vector_to_amplitudes_rhf, build_unique_tamps_map_rhf, _ao2mo_rcc,
-                            format_size, dump_flags, _finalize, _IMDS, _PhysicistsERIs)
+                            format_size, dump_flags as _pyscf_rccsdt_dump_flags, _finalize,
+                            _IMDS, _PhysicistsERIs)
 from pyscf import __config__
 from mpi4py import MPI
 
@@ -127,6 +128,62 @@ def close_t3_runtime_logging(tamps):
     dt3 = t3[0]
     if hasattr(dt3, 'close_communication_log'):
         dt3.close_communication_log()
+
+
+def _format_dump_value(value):
+    if isinstance(value, str):
+        return value
+    return repr(value)
+
+
+def _dump_flag_group(log, title, mycc, names):
+    log.info('%s', title)
+    for name in names:
+        if hasattr(mycc, name):
+            log.info('    %-36s = %s', name, _format_dump_value(getattr(mycc, name)))
+
+
+def dump_flags(mycc, verbose=None):
+    '''Print PySCF RCCSDT flags plus Distributed-CC-specific options.'''
+    if getattr(mycc, 'rank', 0) != 0:
+        return mycc
+
+    _pyscf_rccsdt_dump_flags(mycc, verbose)
+    log = logger.new_logger(mycc, verbose)
+    log.info('')
+    log.info('Distributed-CC options')
+    log.info('    %-36s = %s', 'MPI ranks', getattr(mycc, 'size', 1))
+    _dump_flag_group(log, '    Work distribution', mycc, (
+        'batch_size',
+        'allow_python_fallback',
+    ))
+    _dump_flag_group(log, '    DIIS', mycc, (
+        'nvir_diis',
+        'diis_scratch',
+        'diis_scratch_start',
+        'diis_scratch_cleanup',
+        'diis_scratch_mmap',
+        'incore_complete',
+    ))
+    _dump_flag_group(log, '    Diagnostics', mycc, (
+        'log_memory',
+        'log_memory_per_iter',
+        'log_memory_all_ranks',
+        'log_highest_t_contractions',
+        'log_highest_t_contractions_all_ranks',
+        'contraction_log_dir',
+        'log_highest_t_communication',
+        'communication_log_dir',
+        'log_allreduce_timing',
+    ))
+    _dump_flag_group(log, '    MPI progress', mycc, (
+        'use_mpi_progress_thread',
+        'mpi_progress_poll_interval',
+        'gil_punctuate_duration',
+        'gil_punctuate_interval',
+    ))
+    return mycc
+
 
 def init_amps_rhf(mycc, eris=None):
     '''Initialize CC T-amplitudes for an RHF reference.'''

@@ -152,14 +152,63 @@ def memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, n_tasks=None, local_
     return mycc
 
 
+def _format_dump_value(value):
+    if isinstance(value, str):
+        return value
+    return repr(value)
+
+
+def _dump_flag_group(log, title, pairs):
+    log.info('%s', title)
+    for name, value in pairs:
+        log.info('    %-36s = %s', name, _format_dump_value(value))
+
+
+def dump_flags(mycc, blksize=4, comm=None, job_idx=0, n_jobs=1,
+               release_ijk_t3=False, log_redistribution=False, verbose=None):
+    '''Print RCCSDT(Q)-specific startup options.'''
+    if getattr(mycc, 'rank', 0) != 0:
+        return mycc
+
+    log = logger.new_logger(mycc, verbose)
+    log.info('')
+    log.info('******** RCCSDT(Q) ********')
+    log.info('RCCSDT(Q) nocc = %s, nmo = %s', mycc.nocc, mycc.nmo)
+    _dump_flag_group(log, '    Correction options', (
+        ('MPI ranks', comm.Get_size() if comm is not None else getattr(mycc, 'size', 1)),
+        ('blksize', blksize),
+        ('job_idx', job_idx),
+        ('n_jobs', n_jobs),
+        ('release_ijk_t3', release_ijk_t3),
+        ('log_redistribution', log_redistribution),
+        ('einsum_backend', getattr(mycc, 'einsum_backend', None)),
+        ('allow_python_fallback', getattr(mycc, 'allow_python_fallback', None)),
+    ))
+    _dump_flag_group(log, '    Diagnostics', (
+        ('log_memory', getattr(mycc, 'log_memory', False)),
+        ('log_memory_per_iter', getattr(mycc, 'log_memory_per_iter', False)),
+        ('log_memory_all_ranks', getattr(mycc, 'log_memory_all_ranks', False)),
+        ('log_highest_t_contractions', getattr(mycc, 'log_highest_t_contractions', False)),
+        ('log_highest_t_contractions_all_ranks',
+         getattr(mycc, 'log_highest_t_contractions_all_ranks', False)),
+        ('contraction_log_dir', getattr(mycc, 'contraction_log_dir', 'contraction_logs')),
+        ('log_highest_t_communication', getattr(mycc, 'log_highest_t_communication', False)),
+        ('communication_log_dir', getattr(mycc, 'communication_log_dir', 'comm_logs')),
+    ))
+    _dump_flag_group(log, '    MPI progress', (
+        ('use_mpi_progress_thread', getattr(mycc, 'use_mpi_progress_thread', False)),
+        ('mpi_progress_poll_interval', getattr(mycc, 'mpi_progress_poll_interval', 0.001)),
+        ('gil_punctuate_duration', getattr(mycc, 'gil_punctuate_duration', 0.0001)),
+        ('gil_punctuate_interval', getattr(mycc, 'gil_punctuate_interval', 10)),
+    ))
+    return mycc
+
+
 def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=1, release_ijk_t3=False, log_redistribution=False):
     '''Compute [Q] and (Q) correction terms using the ABC-based algorithm.
     Offsets and tasks are determined by job_idx/n_jobs for job splitting.'''
     time0 = logger.process_clock(), logger.perf_counter()
     log = logger.Logger(mycc.stdout, mycc.verbose)
-
-    if eris is None:
-        eris = mycc.ao2mo(mycc.mo_coeff)
 
     if comm is None:
         comm = MPI.COMM_WORLD
@@ -169,6 +218,13 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     mycc.rank = rank
     mycc.size = size
     log = logger.Logger(mycc.stdout, mycc.verbose if rank == 0 else 0)
+    if rank == 0 and mycc.verbose >= logger.WARN:
+        dump_flags(mycc, blksize=blksize, comm=comm, job_idx=job_idx, n_jobs=n_jobs,
+                   release_ijk_t3=release_ijk_t3, log_redistribution=log_redistribution)
+
+    if eris is None:
+        eris = mycc.ao2mo(mycc.mo_coeff)
+
     memlog = memory_logger(mycc)
     warn_non_pytblis_backend(mycc, "RCCSDT(Q)")
     progress_thread = start_mpi_progress_thread(mycc)
