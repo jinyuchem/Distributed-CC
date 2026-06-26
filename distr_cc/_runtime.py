@@ -17,6 +17,7 @@ import os
 import warnings
 import numpy as np
 from pyscf import lib
+from pyscf.cc.rccsdt import format_size
 from pyscf.lib import logger
 
 _TRUE_ENV_VALUES = {"1", "true", "t", "yes", "y", "on"}
@@ -186,11 +187,11 @@ def unpack_unique_replicated_tamps(mycc, vector, template_tamps, scale=1.0):
     return tamps, offset
 
 def contraction_logger(mycc, flag="log_highest_t_contractions", all_ranks_flag="log_highest_t_contractions_all_ranks"):
-    if getattr(mycc, flag, False):
-        all_ranks = getattr(mycc, all_ranks_flag, False)
-        verbose = logger.DEBUG1 if (mycc.rank == 0 or all_ranks) else 0
-        return logger.Logger(mycc.stdout, verbose)
-    return logger.Logger(mycc.stdout, mycc.verbose if mycc.rank == 0 else 0)
+    if not getattr(mycc, flag, False):
+        return logger.Logger(mycc.stdout, 0)
+    all_ranks = getattr(mycc, all_ranks_flag, False)
+    verbose = logger.DEBUG1 if (getattr(mycc, "rank", 0) == 0 or all_ranks) else 0
+    return logger.Logger(mycc.stdout, verbose)
 
 def contraction_message(mycc, message, flag="log_highest_t_contractions",
                         all_ranks_flag="log_highest_t_contractions_all_ranks"):
@@ -201,21 +202,24 @@ def contraction_message(mycc, message, flag="log_highest_t_contractions",
 def memory_logger(mycc):
     if not getattr(mycc, "log_memory", False):
         return logger.Logger(mycc.stdout, 0)
-    all_ranks = getattr(mycc, "log_memory_all_ranks", True)
-    verbose = logger.DEBUG if (mycc.rank == 0 or all_ranks) else 0
-    return logger.Logger(mycc.stdout, verbose)
+    all_ranks = getattr(mycc, "log_memory_all_ranks", False)
+    if getattr(mycc, "rank", 0) != 0 and not all_ranks:
+        return logger.Logger(mycc.stdout, 0)
+    return logger.Logger(mycc.stdout, logger.DEBUG)
 
 def log_memory(mycc, log=None, label=None, per_iter=False):
     if not getattr(mycc, "log_memory", False):
         return
     if per_iter and not getattr(mycc, "log_memory_per_iter", False):
         return
-    if not getattr(mycc, "log_memory_all_ranks", True) and mycc.rank != 0:
+    all_ranks = getattr(mycc, "log_memory_all_ranks", False)
+    if getattr(mycc, "rank", 0) != 0 and not all_ranks:
         return
     if log is None:
         log = memory_logger(mycc)
     suffix = "" if label is None else " after %s" % label
-    log.debug("        Rank %d memory used%s: %.1f MB", mycc.rank, suffix, lib.current_memory()[0])
+    memory_bytes = int(lib.current_memory()[0] * 1024**2)
+    log.debug("        Rank %d memory used%s: %8s", mycc.rank, suffix, format_size(memory_bytes))
 
 def make_standard_diis(mycc):
     if isinstance(mycc.diis, lib.diis.DIIS):

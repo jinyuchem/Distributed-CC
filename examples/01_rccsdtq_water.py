@@ -21,7 +21,7 @@ mycc = RCCSDTQ(mf, frozen=chemcore(mol), comm=comm)
 mycc.max_cycle = 100
 mycc.conv_tol = 1e-9
 mycc.conv_tol_normt = 1e-7
-mycc.verbose = 5
+mycc.verbose = 8
 # mycc.set_einsum_backend('pytblis')
 mycc.batch_size = 13
 mycc.diis = True
@@ -32,12 +32,14 @@ mycc.diis_scratch = None
 mycc.diis_scratch_start = 0
 mycc.diis_scratch_cleanup = True
 mycc.diis_scratch_mmap = False
-mycc.log_highest_t_communication = False
+
+mycc.log_memory = False
+mycc.log_memory_per_iter = False
+mycc.log_memory_all_ranks = False
 mycc.log_highest_t_contractions = False
 mycc.log_highest_t_contractions_all_ranks = False
-mycc.log_memory = False
-mycc.log_memory_all_ranks = False
-mycc.log_memory_per_iter = False
+mycc.log_highest_t_communication = False
+
 mycc.use_mpi_progress_thread = False
 mycc.mpi_progress_poll_interval = 0.001
 mycc.gil_punctuate_duration = 0.0001

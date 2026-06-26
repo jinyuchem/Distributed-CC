@@ -55,6 +55,33 @@ _MPI_ALLREDUCE_MAX_BYTES = int(getattr(
     __config__, 'cc_mpi_rccsdtq_allreduce_max_bytes', 1 << 30))
 
 
+def configure_t4_runtime_logging(mycc, tamps):
+    if tamps is None or len(tamps) < 4:
+        return
+    t4 = tamps[3]
+    if not isinstance(t4, (tuple, list)) or len(t4) < 1:
+        return
+    dt4 = t4[0]
+    enabled = getattr(mycc, 'log_highest_t_communication', False)
+    log_dir = getattr(mycc, 'communication_log_dir', 'comm_logs')
+    if hasattr(dt4, 'configure_communication_logging'):
+        dt4.configure_communication_logging(enabled=enabled, log_dir=log_dir)
+    else:
+        dt4.log_t4_communication = bool(enabled)
+        dt4.communication_log_dir = log_dir
+
+
+def close_t4_runtime_logging(tamps):
+    if tamps is None or len(tamps) < 4:
+        return
+    t4 = tamps[3]
+    if not isinstance(t4, (tuple, list)) or len(t4) < 1:
+        return
+    dt4 = t4[0]
+    if hasattr(dt4, 'close_communication_log'):
+        dt4.close_communication_log()
+
+
 def _report_allreduce_timing(comm, log, label, arr, elapsed, nchunks, max_count):
     if log is None:
         return
@@ -103,7 +130,7 @@ def _allreduce_inplace_large(comm, buf, op=MPI.SUM, max_count=None, log=None, la
 
 
 def _allreduce_inplace_mpi_rccsdtq(mycc, buf, label, op=MPI.SUM):
-    log_timing = (getattr(mycc, 'log_allreduce_timing', False) or getattr(mycc, 'log_t4_communication', False))
+    log_timing = getattr(mycc, 'log_allreduce_timing', False)
     log = None
     if log_timing:
         log = logger.Logger(mycc.stdout, logger.INFO if mycc.rank == 0 else 0)
@@ -249,7 +276,8 @@ def init_amps_rhf(mycc, eris=None):
         dt4 = DistributedT4IJKL(nocc, nvir, comm=mycc.comm, batch_size=mycc.batch_size, dtype=t1.dtype,
                               allow_python_fallback=mycc.allow_python_fallback)
         dt4.log = logger.new_logger(mycc)
-        dt4.log_t4_communication = mycc.log_highest_t_communication
+        dt4.configure_communication_logging(enabled=mycc.log_highest_t_communication,
+                                            log_dir=mycc.communication_log_dir)
         dt4.print_distribution_info()
         t4_local = dt4.allocate_local()
         t4 = (dt4, t4_local)
@@ -1053,7 +1081,9 @@ def compute_oooo_oovv_contraction_(mycc, imds, t4, r4_local):
         if n_batches > 0 and mycc.size > 1:
             batch_start, batch_end = batches[0]
             batch_ijkl = ijkl_list[batch_start:batch_end]
-            handle = dt4.prefetch_t4_quadruples_allgather(t4_local, batch_ijkl)
+            handle = dt4.prefetch_t4_quadruples_allgather(
+                t4_local, batch_ijkl, batch_index=1,
+                batch_start=batch_start, batch_end=batch_end)
             if progress_thread is not None and handle is not None:
                 progress_thread.add_requests(handle.get('reqs', ()))
 
@@ -1067,7 +1097,9 @@ def compute_oooo_oovv_contraction_(mycc, imds, t4, r4_local):
                 next_start, next_end = batches[i_batch + 1]
                 next_batch_ijkl = ijkl_list[next_start:next_end]
                 if mycc.size > 1:
-                    handle_next = dt4.prefetch_t4_quadruples_allgather(t4_local, next_batch_ijkl)
+                    handle_next = dt4.prefetch_t4_quadruples_allgather(
+                        t4_local, next_batch_ijkl, batch_index=i_batch + 2,
+                        batch_start=next_start, batch_end=next_end)
                     if progress_thread is not None and handle_next is not None:
                         progress_thread.add_requests(handle_next.get('reqs', ()))
 
@@ -1524,6 +1556,7 @@ def kernel(mycc, eris=None, tamps=None, tol=1e-8, tolnormt=1e-6, max_cycle=50, v
                 t4_local = np.ascontiguousarray(tamps[3])
             dt4.log = logger.new_logger(mycc)
             tamps[3] = (dt4, t4_local)
+    configure_t4_runtime_logging(mycc, tamps)
 
     name = mycc.__class__.__name__
 
@@ -1590,6 +1623,7 @@ def kernel(mycc, eris=None, tamps=None, tol=1e-8, tolnormt=1e-6, max_cycle=50, v
     if adiis_t4 is not None and getattr(adiis_t4, 'cleanup', False):
         adiis_t4.clean_scratch()
 
+    close_t4_runtime_logging(tamps)
     return converged, e_corr, tamps
 
 

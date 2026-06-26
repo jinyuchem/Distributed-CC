@@ -27,7 +27,9 @@ where each canonical occupied quadruple is assigned to exactly one MPI rank.
 All other tensors in the RCCSDTQ implementation are expected to be replicated.
 """
 
+import csv
 import json
+import os
 from itertools import permutations
 import numpy as np
 from mpi4py import MPI
@@ -155,16 +157,62 @@ class DistributedT4IJKL:
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
         self.log_t4_communication = False
+        self.communication_log_dir = 'comm_logs'
+        self._communication_log_file = None
+        self._communication_log_writer = None
 
         self._compute_distribution(distribution, batch_size=batch_size)
         self._build_local_mapping()
 
         self.log = None
 
-    def _log_communication(self, message):
+    def configure_communication_logging(self, enabled=None, log_dir=None):
+        if enabled is not None:
+            self.log_t4_communication = bool(enabled)
+        if log_dir is not None:
+            self.communication_log_dir = log_dir
         if not self.log_t4_communication:
+            self.close_communication_log()
+        return self
+
+    def _ensure_communication_log(self):
+        if not getattr(self, "log_t4_communication", False):
+            return None
+        if self._communication_log_writer is not None:
+            return self._communication_log_writer
+
+        log_dir = os.path.expanduser(os.path.expandvars(
+            str(getattr(self, 'communication_log_dir', 'comm_logs') or 'comm_logs')))
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'rccsdtq_t4_comm_rank%04d.csv' % self.rank)
+        fields = (
+            'event', 'rank', 'size', 'batch', 'batch_start', 'batch_end',
+            'n_quadruples', 'n_zero_quadruples', 'nocc', 'nvir', 'block_len', 'dtype',
+            'send_count', 'recv_count', 'send_bytes', 'recv_bytes',
+            'counts_min', 'counts_max', 'counts_mean', 'counts_nonzero',
+            'recv_buffer_reallocated', 'send_buffer_reallocated',
+            'recv_buffer_bytes', 'send_buffer_bytes',
+            'created_mpi_type', 'issue_time', 'wait_time',
+            'comm_total', 'finalize_time',
+        )
+        self._communication_log_file = open(log_path, 'w', newline='')
+        self._communication_log_writer = csv.DictWriter(self._communication_log_file, fieldnames=fields)
+        self._communication_log_writer.writeheader()
+        self._communication_log_file.flush()
+        return self._communication_log_writer
+
+    def _write_communication_log(self, row):
+        writer = self._ensure_communication_log()
+        if writer is None:
             return
-        print(f"        Rank {self.rank} {message}", flush=True)
+        writer.writerow(row)
+        self._communication_log_file.flush()
+
+    def close_communication_log(self):
+        if self._communication_log_file is not None:
+            self._communication_log_file.close()
+        self._communication_log_file = None
+        self._communication_log_writer = None
 
     def _enumerate_ijkl_quadruples(self):
         return enumerate_stored_ijkl_quadruples(self.nocc)
@@ -656,7 +704,8 @@ class DistributedT4IJKL:
         unpack_t4_ijkl_single_(t4_local, t4_blk, self.full_to_local_offset, i0, j0, k0, l0, self.nocc, self.nvir)
         return t4_blk
 
-    def prefetch_t4_quadruples_allgather(self, t4_local, ijkl_quadruples):
+    def prefetch_t4_quadruples_allgather(self, t4_local, ijkl_quadruples,
+                                         batch_index=None, batch_start=None, batch_end=None):
         """
         Start a non-blocking allgather prefetch for canonical T4 quadruples.
         """
@@ -669,6 +718,7 @@ class DistributedT4IJKL:
         nvir = self.nvir
         ijkl_quadruples = _as_canonical_quadruples(ijkl_quadruples)
         n_quad = len(ijkl_quadruples)
+        itemsize = np.dtype(self.dtype).itemsize
 
         if n_quad == 0 or self.size == 1:
             return None
@@ -682,6 +732,8 @@ class DistributedT4IJKL:
         total_recv = int(counts.sum())
 
         required_recv_size = total_recv * nvir * nvir * nvir * nvir
+        recv_reallocated = int(required_recv_size > 0 and
+                               (self.recv_buffers[pidx] is None or self.recv_buffers[pidx].size < required_recv_size))
         if required_recv_size == 0:
             recv_data = np.empty((0, nvir, nvir, nvir, nvir), dtype=self.dtype)
         elif self.recv_buffers[pidx] is None or self.recv_buffers[pidx].size < required_recv_size:
@@ -691,6 +743,8 @@ class DistributedT4IJKL:
             recv_data = self.recv_buffers[pidx][:total_recv]
 
         required_send_size = my_send_count * nvir * nvir * nvir * nvir
+        send_reallocated = int(required_send_size > 0 and
+                               (self.send_buffers[pidx] is None or self.send_buffers[pidx].size < required_send_size))
         if required_send_size == 0:
             send_data = np.empty((0, nvir, nvir, nvir, nvir), dtype=self.dtype)
         elif self.send_buffers[pidx] is None or self.send_buffers[pidx].size < required_send_size:
@@ -702,20 +756,58 @@ class DistributedT4IJKL:
         self._fill_send_data(t4_local, send_data, my_indices)
 
         t0_issue = logger.perf_counter()
+        block_size = nvir * nvir * nvir * nvir
+        created_mpi_type = 0
         if total_recv == 0:
             reqs = []
         else:
             if self.quadruple_type is None:
-                block_size = nvir * nvir * nvir * nvir
                 self.quadruple_type = self._mpi_dtype().Create_contiguous(block_size)
                 self.quadruple_type.Commit()
+                created_mpi_type = 1
 
             req = self.comm.Iallgatherv([send_data.ravel(), my_send_count, self.quadruple_type],
                                         [recv_data.ravel(), counts, displs, self.quadruple_type])
             reqs = [req]
         t1_issue = logger.perf_counter()
-        self._log_communication(f"T4 prefetch issue: nreq={n_quad}, send={my_send_count}, "
-                                f"recv={total_recv}, post time {t1_issue - t0_issue:.4f} sec.")
+        counts_mean = float(counts.mean()) if counts.size else 0.0
+        recv_buffer_bytes = (int(self.recv_buffers[pidx].nbytes)
+                             if self.recv_buffers[pidx] is not None else int(recv_data.nbytes))
+        send_buffer_bytes = (int(self.send_buffers[pidx].nbytes)
+                             if self.send_buffers[pidx] is not None else int(send_data.nbytes))
+        comm_metrics = {
+            'rank': int(self.rank),
+            'size': int(self.size),
+            'batch': '' if batch_index is None else int(batch_index),
+            'batch_start': '' if batch_start is None else int(batch_start),
+            'batch_end': '' if batch_end is None else int(batch_end),
+            'n_quadruples': int(n_quad),
+            'n_zero_quadruples': int(len(zero_quadruples)),
+            'nocc': int(self.nocc),
+            'nvir': int(nvir),
+            'block_len': int(block_size),
+            'dtype': np.dtype(self.dtype).str,
+            'send_count': int(my_send_count),
+            'recv_count': int(total_recv),
+            'send_bytes': int(required_send_size * itemsize),
+            'recv_bytes': int(required_recv_size * itemsize),
+            'counts_min': int(counts.min()) if counts.size else 0,
+            'counts_max': int(counts.max()) if counts.size else 0,
+            'counts_mean': counts_mean,
+            'counts_nonzero': int(np.count_nonzero(counts)),
+            'recv_buffer_reallocated': int(recv_reallocated),
+            'send_buffer_reallocated': int(send_reallocated),
+            'recv_buffer_bytes': recv_buffer_bytes,
+            'send_buffer_bytes': send_buffer_bytes,
+            'created_mpi_type': int(created_mpi_type),
+            'issue_time': float(t1_issue - t0_issue),
+            'wait_time': '',
+            'comm_total': '',
+            'finalize_time': '',
+        }
+        issue_row = dict(comm_metrics)
+        issue_row['event'] = 'issue'
+        self._write_communication_log(issue_row)
 
         return {
             "reqs": reqs,
@@ -726,6 +818,7 @@ class DistributedT4IJKL:
             "ijkl_quadruples": ijkl_quadruples,
             "t0_issue": t0_issue,
             "t1_issue": t1_issue,
+            "comm_metrics": comm_metrics,
         }
 
     def finalize_prefetch_t4_quadruples(self, handle, t4_local, ijkl_quadruples):
@@ -746,15 +839,20 @@ class DistributedT4IJKL:
         t0_finalize = logger.perf_counter()
         if handle["reqs"]:
             MPI.Request.Waitall(handle["reqs"])
-        t1_finalize = logger.perf_counter()
-        t0_issue = handle.get("t0_issue", t0_finalize)
-        t1_issue = handle.get("t1_issue", t0_issue)
-        self._log_communication(f"T4 prefetch finalize: nreq={n_quad}, post time {t1_issue - t0_issue:.4f} sec., "
-                                f"elapsed since issue {t1_finalize - t0_issue:.4f} sec., "
-                                f"wait time {t1_finalize - t0_finalize:.4f} sec.")
+        t1_wait = logger.perf_counter()
 
-        return self._append_zero_blocks(handle["recv_data"], handle["quadruples_by_owner"],
-                                        handle.get("zero_quadruples", []))
+        result = self._append_zero_blocks(handle["recv_data"], handle["quadruples_by_owner"],
+                                          handle.get("zero_quadruples", []))
+        t1_finalize = logger.perf_counter()
+        metrics = dict(handle.get("comm_metrics", {}))
+        if metrics:
+            metrics['event'] = 'finalize'
+            metrics['wait_time'] = float(t1_wait - t0_finalize)
+            metrics['comm_total'] = float(t1_wait - handle.get("t0_issue", t0_finalize))
+            metrics['finalize_time'] = float(t1_finalize - t0_finalize)
+            self._write_communication_log(metrics)
+
+        return result
 
     def print_distribution_info(self):
         """Print distribution information."""
@@ -864,6 +962,9 @@ class DistributedT4IJKL:
         dist_t4.rank = rank
         dist_t4.size = size
         dist_t4.log_t4_communication = False
+        dist_t4.communication_log_dir = 'comm_logs'
+        dist_t4._communication_log_file = None
+        dist_t4._communication_log_writer = None
         dist_t4.rank_quadruples = saved_rank_quadruples
         dist_t4.local_quadruples = saved_rank_quadruples[rank]
 

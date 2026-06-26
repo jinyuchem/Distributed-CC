@@ -16,7 +16,7 @@ comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 if rank == 0:
     os.makedirs('output', exist_ok=True)
-outdir = 'output'
+outdir = 'output/'
 
 atom = '''
 O   -0.066999140   0.000000000   1.494354740
@@ -27,23 +27,23 @@ H    0.068855100   0.000000000   0.539142770
 mol = gto.M(atom=atom, basis="ccpvdz", verbose=0)
 mf = scf.RHF(mol)
 if rank == 0:
-    mf.chkfile = 'output/mf.chk'
+    mf.chkfile = outdir + 'mf.chk'
 mf.kernel()
 
 mycc = RCCSDT(mf, frozen=chemcore(mol), comm=comm)
 mycc.max_cycle = 100
-mycc.verbose = 4
+mycc.verbose = 8
 mycc.kernel()
 
 if rank == 0:
-    np.save('output/t1.npy', mycc.tamps[0])
-    np.save('output/t2.npy', mycc.tamps[1])
+    np.save(outdir + '/t1.npy', mycc.tamps[0])
+    np.save(outdir + '/t2.npy', mycc.tamps[1])
 comm.Barrier()
 dt3, t3_local = mycc.tamps[2]
-dt3.save_to_disk(t3_local, prefix='output/')
+dt3.save_to_disk(t3_local, prefix=outdir)
 comm.Barrier()
 
-mol2, scf_res = load_scf('output/mf.chk')
+mol2, scf_res = load_scf(outdir + 'mf.chk')
 if isinstance(mol2, dict):
     mol2 = gto.M(**mol2)
 mf2 = scf.RHF(mol2)
@@ -51,13 +51,19 @@ mf2.__dict__.update(scf_res)
 mf2._eri = mol2.intor("int2e")
 mf2.converged = True
 
+if rank == 0:
+    print('=' * 80)
+    print('Restarting RCCSDT calculation')
+    print('=' * 80)
 cc2 = RCCSDT(mf2, frozen=chemcore(mol2), comm=MPI.COMM_WORLD)
 cc2.conv_tol = 1e-8
 cc2.max_cycle = 1
-cc2.verbose = 0
-t1 = np.load('output/t1.npy')
-t2 = np.load('output/t2.npy')
-dt3, t3_local = DistributedT3IJK.load_from_disk('output/', MPI.COMM_WORLD, mmap_mode=None)
+cc2.verbose = 8
+cc2.batch_size = 4
+
+t1 = np.load(outdir + 't1.npy')
+t2 = np.load(outdir + 't2.npy')
+dt3, t3_local = DistributedT3IJK.load_from_disk(outdir, MPI.COMM_WORLD, mmap_mode=None)
 tamps = [t1, t2, (dt3, t3_local)]
 cc2.kernel(tamps=tamps)
 
@@ -67,7 +73,7 @@ if rank == 0:
     print('RCCSDT correlation energy after restart % .12f' % cc2.e_corr)
     print('RCCSDT correlation energy reference     % .12f' % ref_ecorr)
 
-q_bracket, q_paren = rccsdt_q.kernel(cc2, comm=comm, blksize=8, release_ijk_t3=False)
+q_bracket, q_paren = rccsdt_q.kernel(cc2, comm=comm, blksize=8, release_ijk_t3=False, log_redistribution=False)
 
 ref_q_bracket, ref_q_paren = -0.000440859544, -0.000488539476
 if rank == 0:

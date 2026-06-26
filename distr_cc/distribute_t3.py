@@ -25,6 +25,8 @@ across multiple MPI ranks using direct (i,j,k) triple distribution for optimal l
 """
 
 import sys
+import csv
+import os
 import numpy as np
 import json
 
@@ -123,12 +125,57 @@ class DistributedT3IJK:
         self._build_local_mapping()
         self._setup_permutation_maps()
         self.log_t3_communication = False
+        self.communication_log_dir = 'comm_logs'
+        self._communication_log_file = None
+        self._communication_log_writer = None
         self.log = None # Logger object
 
-    def _log_communication(self, message):
+    def configure_communication_logging(self, enabled=None, log_dir=None):
+        if enabled is not None:
+            self.log_t3_communication = bool(enabled)
+        if log_dir is not None:
+            self.communication_log_dir = log_dir
+        if not self.log_t3_communication:
+            self.close_communication_log()
+        return self
+
+    def _ensure_communication_log(self):
         if not getattr(self, "log_t3_communication", False):
+            return None
+        if self._communication_log_writer is not None:
+            return self._communication_log_writer
+
+        log_dir = os.path.expanduser(os.path.expandvars(str(getattr(self, 'communication_log_dir', 'comm_logs') or 'comm_logs')))
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'rccsdt_t3_comm_rank%04d.csv' % self.rank)
+        fields = (
+            'event', 'rank', 'size', 'batch', 'batch_start', 'batch_end',
+            'n_triples', 'nocc', 'nvir', 'block_len', 'dtype',
+            'send_count', 'recv_count', 'send_bytes', 'recv_bytes',
+            'counts_min', 'counts_max', 'counts_mean', 'counts_nonzero',
+            'recv_buffer_reallocated', 'send_buffer_reallocated',
+            'recv_buffer_bytes', 'send_buffer_bytes',
+            'created_mpi_type', 'issue_time', 'wait_time',
+            'comm_total', 'finalize_time',
+        )
+        self._communication_log_file = open(log_path, 'w', newline='')
+        self._communication_log_writer = csv.DictWriter(self._communication_log_file, fieldnames=fields)
+        self._communication_log_writer.writeheader()
+        self._communication_log_file.flush()
+        return self._communication_log_writer
+
+    def _write_communication_log(self, row):
+        writer = self._ensure_communication_log()
+        if writer is None:
             return
-        print(f"        Rank {self.rank} {message}", flush=True)
+        writer.writerow(row)
+        self._communication_log_file.flush()
+
+    def close_communication_log(self):
+        if self._communication_log_file is not None:
+            self._communication_log_file.close()
+        self._communication_log_file = None
+        self._communication_log_writer = None
 
     def _enumerate_ijk_triples(self):
         """Enumerate all canonical (i,j,k) triples with i <= j <= k."""
@@ -689,7 +736,8 @@ class DistributedT3IJK:
                     t3_blk[aa, bb, cc] = t3_slice[a, b, c]
         return t3_blk
 
-    def prefetch_t3_triples_iallgather(self, t3_local, ijk_triples, batch_size_hint=None):
+    def prefetch_t3_triples_iallgather(self, t3_local, ijk_triples, batch_size_hint=None,
+                                       batch_index=None, batch_start=None, batch_end=None):
         """
         Non-blocking prefetch using MPI_Iallgatherv and double buffering.
 
@@ -710,6 +758,7 @@ class DistributedT3IJK:
 
         nocc, nvir = self.nocc, self.nvir
         n_tri = len(ijk_triples)
+        itemsize = np.dtype(self.dtype).itemsize
 
         # 1. Determine Ownership and construct triples_by_owner (needed for finalize)
         ijk_indices = np.array([ijk_to_linear(i, j, k, nocc) for i, j, k in ijk_triples], dtype=np.int32)
@@ -735,20 +784,16 @@ class DistributedT3IJK:
 
         # 3. Manage Receive Buffer
         required_recv_size = total_recv * nvir * nvir * nvir
+        recv_reallocated = int(self.recv_buffers[pidx] is None or self.recv_buffers[pidx].size < required_recv_size)
         if self.recv_buffers[pidx] is None or self.recv_buffers[pidx].size < required_recv_size:
-            if self.log:
-                self.log.debug(f"Rank {self.rank}: Allocating recv_buffer[{pidx}] "
-                               f"(Iallgatherv) size {required_recv_size/1e9:.3f} GB")
             self.recv_buffers[pidx] = np.empty((total_recv, nvir, nvir, nvir), dtype=self.dtype)
 
         recv_data = self.recv_buffers[pidx][:total_recv] # View
 
         # 4. Manage Send Buffer
         required_send_size = my_send_count * nvir * nvir * nvir
+        send_reallocated = int(self.send_buffers[pidx] is None or self.send_buffers[pidx].size < required_send_size)
         if self.send_buffers[pidx] is None or self.send_buffers[pidx].size < required_send_size:
-            if self.log:
-                self.log.debug(f"Rank {self.rank}: Allocating send_buffer[{pidx}] "
-                               f"(Iallgatherv) size {required_send_size/1e9:.3f} GB")
             self.send_buffers[pidx] = np.empty((my_send_count, nvir, nvir, nvir), dtype=self.dtype)
 
         send_data = self.send_buffers[pidx][:my_send_count]
@@ -770,18 +815,53 @@ class DistributedT3IJK:
         send_buf = send_data.reshape(-1) # Flatten view
         recv_buf = recv_data.reshape(-1) # Flatten view
 
+        created_mpi_type = 0
         if not hasattr(self, 'triple_type'):
             block_len = nvir * nvir * nvir
             self.triple_type = MPI.DOUBLE.Create_contiguous(block_len)
             self.triple_type.Commit()
-            self._log_communication(f"Created custom MPI type for triples (block_len={block_len})")
+            created_mpi_type = 1
+        else:
+            block_len = nvir * nvir * nvir
 
         req = self.comm.Iallgatherv([send_buf, my_send_count, self.triple_type],
                                     [recv_buf, counts, displs, self.triple_type])
         reqs = [req]
 
         t1_issue = logger.perf_counter()
-        self._log_communication(f"Prefetch (Iallgatherv): issue time: {t1_issue-t0_coll:.4f} sec.")
+        counts_mean = float(counts.mean()) if counts.size else 0.0
+        comm_metrics = {
+            'rank': int(self.rank),
+            'size': int(self.size),
+            'batch': '' if batch_index is None else int(batch_index),
+            'batch_start': '' if batch_start is None else int(batch_start),
+            'batch_end': '' if batch_end is None else int(batch_end),
+            'n_triples': int(n_tri),
+            'nocc': int(nocc),
+            'nvir': int(nvir),
+            'block_len': int(block_len),
+            'dtype': np.dtype(self.dtype).str,
+            'send_count': int(my_send_count),
+            'recv_count': int(total_recv),
+            'send_bytes': int(required_send_size * itemsize),
+            'recv_bytes': int(required_recv_size * itemsize),
+            'counts_min': int(counts.min()) if counts.size else 0,
+            'counts_max': int(counts.max()) if counts.size else 0,
+            'counts_mean': counts_mean,
+            'counts_nonzero': int(np.count_nonzero(counts)),
+            'recv_buffer_reallocated': int(recv_reallocated),
+            'send_buffer_reallocated': int(send_reallocated),
+            'recv_buffer_bytes': int(self.recv_buffers[pidx].nbytes),
+            'send_buffer_bytes': int(self.send_buffers[pidx].nbytes),
+            'created_mpi_type': int(created_mpi_type),
+            'issue_time': float(t1_issue - t0_coll),
+            'wait_time': '',
+            'comm_total': '',
+            'finalize_time': '',
+        }
+        issue_row = dict(comm_metrics)
+        issue_row['event'] = 'issue'
+        self._write_communication_log(issue_row)
 
         return {
             'reqs': reqs,
@@ -791,6 +871,7 @@ class DistributedT3IJK:
             'ijk_triples': ijk_triples,
             'counts': counts,
             't0_coll': t0_coll,
+            'comm_metrics': comm_metrics,
             'is_allgather': True
         }
 
@@ -833,30 +914,40 @@ class DistributedT3IJK:
         triples_by_owner = handle['triples_by_owner']
         ijk_reordered = np.array([triple for r in range(self.size) for triple in triples_by_owner[r]], dtype=np.int32)
         t1_finalize = logger.perf_counter()
-        self._log_communication(f"Prefetch: comm (issue+wait) time: {t1_wait - handle['t0_coll']:.4f} sec.")
-        self._log_communication(f"Prefetch: finalize time: {t1_finalize - t0_finalize:.4f} sec.")
+        metrics = dict(handle.get('comm_metrics', {}))
+        if metrics:
+            metrics['event'] = 'finalize'
+            metrics['wait_time'] = float(t1_wait - t0_finalize)
+            metrics['comm_total'] = float(t1_wait - handle['t0_coll'])
+            metrics['finalize_time'] = float(t1_finalize - t0_finalize)
+            self._write_communication_log(metrics)
 
         return recv_data, ijk_reordered
 
     def print_distribution_info(self):
         """Print distribution information."""
-        if self.rank == 0:
-            print(f"\nDistributedT3IJK Configuration:")
-            print(f"  nocc = {self.nocc}, nvir = {self.nvir}")
-            print(f"  Distribution strategy: {self.distribution}")
-            print(f"  Total canonical triples: {self.nocc3}")
-            print(f"  Number of MPI ranks: {self.size}")
-            print(f"  C library loaded: {_HAS_C_LIB}")
-            print(f"\nDistribution by rank:")
-
-        self.comm.Barrier()
-
+        if self.rank != 0:
+            return
+        lines = [
+            "",
+            "DistributedT3IJK Configuration:",
+            f"  nocc = {self.nocc}, nvir = {self.nvir}",
+            f"  Distribution strategy: {self.distribution}",
+            f"  Total canonical triples: {self.nocc3}",
+            f"  Number of MPI ranks: {self.size}",
+            f"  C library loaded: {_HAS_C_LIB}",
+            "",
+            "Distribution by rank:",
+        ]
         for r in range(self.size):
-            if self.rank == r:
-                n_triples = len(self.rank_triples[r])
-                pct = 100.0 * n_triples / self.nocc3 if self.nocc3 > 0 else 0
-                print(f"  Rank {r:3d}: {n_triples:6d} triples ({pct:.1f}%)")
-            self.comm.Barrier()
+            n_triples = len(self.rank_triples[r])
+            pct = 100.0 * n_triples / self.nocc3 if self.nocc3 > 0 else 0
+            lines.append(f"  Rank {r:3d}: {n_triples:6d} triples ({pct:.1f}%)")
+        if self.log:
+            for line in lines:
+                self.log.info("%s", line)
+        else:
+            print("\n".join(lines))
 
     def memory_usage_bytes(self):
         itemsize = np.dtype(self.dtype).itemsize
@@ -938,6 +1029,9 @@ class DistributedT3IJK:
         dist_t3 = cls.__new__(cls)
         dist_t3.log = None
         dist_t3.log_t3_communication = False
+        dist_t3.communication_log_dir = 'comm_logs'
+        dist_t3._communication_log_file = None
+        dist_t3._communication_log_writer = None
         dist_t3.nocc = nocc
         dist_t3.nvir = nvir
         dist_t3.dtype = dtype
@@ -1447,7 +1541,8 @@ def _build_send_buffers_for_chunk_ijk_c(dt3_ijk, dt3_abc, t3_local_ijk, chunk_tr
     return send_buffer, send_counts
 
 
-def redistribute_ijk_to_abc(dt3_ijk, t3_local_ijk, comm, blksize_abc=None, chunk_size=None):
+def redistribute_ijk_to_abc(dt3_ijk, t3_local_ijk, comm, blksize_abc=None, chunk_size=None,
+                            log_redistribution=True, verbose=None, stdout=None):
     """
     C-accelerated redistribution of T3 amplitudes from (i <= j <= k, a,b,c) to (a <= b <= c, i,j,k).
     """
@@ -1456,7 +1551,11 @@ def redistribute_ijk_to_abc(dt3_ijk, t3_local_ijk, comm, blksize_abc=None, chunk
     nocc = dt3_ijk.nocc
     nvir = dt3_ijk.nvir
 
-    log = logger.Logger(sys.stdout, 5)
+    if verbose is None:
+        verbose = logger.INFO
+    if not log_redistribution:
+        verbose = 0
+    log = logger.Logger(sys.stdout if stdout is None else stdout, verbose)
     cput0 = (logger.process_clock(), logger.perf_counter())
 
     if rank == 0:

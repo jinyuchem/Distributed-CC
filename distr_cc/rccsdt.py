@@ -37,11 +37,96 @@ if __package__ in (None, ""):
 
 from distr_cc._c_rccsdt import t3_single_spin_summation_inplace_, t3_spin_summation_triple_sym_, t3_transpose_add_
 from distr_cc._mpi import punctuate_mpi_progress, start_mpi_progress_thread
-from distr_cc._runtime import (contraction_logger, log_memory, make_mpi_diis, make_standard_diis, memory_logger,
-                            norm_sq_from_norms, pack_unique_replicated_tamps, unpack_unique_replicated_tamps,
-                            vector_delta_norm_sq, resolve_diis_incore_space, resolve_diis_scratch, resolve_nvir_diis,
-                            warn_non_pytblis_backend)
+from distr_cc._runtime import (contraction_logger, contraction_message, log_memory, make_mpi_diis, make_standard_diis,
+                            memory_logger, norm_sq_from_norms, pack_unique_replicated_tamps,
+                            unpack_unique_replicated_tamps, vector_delta_norm_sq, resolve_diis_incore_space,
+                            resolve_diis_scratch, resolve_nvir_diis, warn_non_pytblis_backend)
 from distr_cc.distribute_t3 import DistributedT3IJK
+
+_MPI_INT_MAX = np.iinfo(np.intc).max
+_MPI_ALLREDUCE_MAX_BYTES = int(getattr(
+    __config__, 'cc_mpi_rccsdt_allreduce_max_bytes', 1 << 30))
+
+
+def _report_allreduce_timing(comm, log, label, arr, elapsed, nchunks, max_count):
+    if log is None:
+        return
+
+    elapsed_max = comm.allreduce(elapsed, op=MPI.MAX)
+    if comm.Get_rank() != 0:
+        return
+
+    label = label or 'buffer'
+    log.info('allreduce %s: %.4f sec max over %d ranks, buffer %s, chunks %d, chunk <= %s',
+             label, elapsed_max, comm.Get_size(), format_size(arr.nbytes),
+             nchunks, format_size(max_count * arr.dtype.itemsize))
+
+
+def _allreduce_inplace_large(comm, buf, op=MPI.SUM, max_count=None, log=None, label=None, log_timing=False):
+    '''In-place Allreduce for NumPy buffers larger than MPI's int count.'''
+    arr = np.asarray(buf)
+    if arr.size == 0 or comm.Get_size() == 1:
+        return buf
+
+    if max_count is None:
+        max_count = _MPI_ALLREDUCE_MAX_BYTES // arr.dtype.itemsize
+    max_count = max(1, min(int(max_count), _MPI_INT_MAX))
+
+    if not arr.flags['C_CONTIGUOUS']:
+        time0 = MPI.Wtime() if log_timing else None
+        tmp = np.ascontiguousarray(arr)
+        _allreduce_inplace_large(comm, tmp, op=op, max_count=max_count)
+        arr[...] = tmp.reshape(arr.shape)
+        if log_timing:
+            nchunks = (tmp.size + max_count - 1) // max_count
+            _report_allreduce_timing(comm, log, label, arr, MPI.Wtime() - time0, nchunks, max_count)
+        return buf
+
+    flat = arr.reshape(-1)
+    nchunks = (flat.size + max_count - 1) // max_count
+    time0 = MPI.Wtime() if log_timing else None
+    if flat.size <= max_count:
+        comm.Allreduce(MPI.IN_PLACE, arr, op=op)
+    else:
+        for p0 in range(0, flat.size, max_count):
+            comm.Allreduce(MPI.IN_PLACE, flat[p0:p0 + max_count], op=op)
+    if log_timing:
+        _report_allreduce_timing(comm, log, label, arr, MPI.Wtime() - time0, nchunks, max_count)
+    return buf
+
+
+def _allreduce_inplace_mpi_rccsdt(mycc, buf, label, op=MPI.SUM):
+    log_timing = getattr(mycc, 'log_allreduce_timing', False)
+    log = None
+    if log_timing:
+        log = logger.Logger(mycc.stdout, logger.INFO if mycc.rank == 0 else 0)
+    return _allreduce_inplace_large(mycc.comm, buf, op=op, log=log, label=label, log_timing=log_timing)
+
+
+def configure_t3_runtime_logging(mycc, tamps):
+    if tamps is None or len(tamps) < 3:
+        return
+    t3 = tamps[2]
+    if not isinstance(t3, (tuple, list)) or len(t3) < 1:
+        return
+    dt3 = t3[0]
+    enabled = getattr(mycc, 'log_highest_t_communication', False)
+    log_dir = getattr(mycc, 'communication_log_dir', 'comm_logs')
+    if hasattr(dt3, 'configure_communication_logging'):
+        dt3.configure_communication_logging(enabled=enabled, log_dir=log_dir)
+    else:
+        dt3.log_t3_communication = bool(enabled)
+        dt3.communication_log_dir = log_dir
+
+def close_t3_runtime_logging(tamps):
+    if tamps is None or len(tamps) < 3:
+        return
+    t3 = tamps[2]
+    if not isinstance(t3, (tuple, list)) or len(t3) < 1:
+        return
+    dt3 = t3[0]
+    if hasattr(dt3, 'close_communication_log'):
+        dt3.close_communication_log()
 
 def init_amps_rhf(mycc, eris=None):
     '''Initialize CC T-amplitudes for an RHF reference.'''
@@ -85,7 +170,8 @@ def init_amps_rhf(mycc, eris=None):
         dt3 = DistributedT3IJK(nocc, nvir, comm=mycc.comm, batch_size=mycc.batch_size, dtype=t1.dtype,
                               allow_python_fallback=mycc.allow_python_fallback)
         dt3.log = logger.new_logger(mycc)
-        dt3.log_t3_communication = mycc.log_highest_t_communication
+        dt3.configure_communication_logging(enabled=mycc.log_highest_t_communication,
+                                            log_dir=mycc.communication_log_dir)
         dt3.print_distribution_info()
         t3_local = dt3.allocate_local()
         t3 = (dt3, t3_local)
@@ -137,7 +223,7 @@ def r1r2_add_t3_tri_(mycc, imds, r1, r2, t3):
     t3_tmp = None
 
     r1_loc = np.ascontiguousarray(r1_loc)
-    mycc.comm.Allreduce(MPI.IN_PLACE, r1_loc, op=MPI.SUM)
+    _allreduce_inplace_mpi_rccsdt(mycc, r1_loc, 'r1_loc_t3', op=MPI.SUM)
     r1 += r1_loc
 
     t3_tmp = np.empty((nvir,) * 3, dtype=t3_local.dtype)
@@ -160,7 +246,7 @@ def r1r2_add_t3_tri_(mycc, imds, r1, r2, t3):
             einsum("la,abc->lbc", t1_eris[pk, pi, :nocc, nocc:], t3_tmp, out=r2_loc[pj], alpha=-1.0, beta=1.0)
 
     r2_loc = np.ascontiguousarray(r2_loc)
-    mycc.comm.Allreduce(MPI.IN_PLACE, r2_loc, op=MPI.SUM)
+    _allreduce_inplace_mpi_rccsdt(mycc, r2_loc, 'r2_loc_t3', op=MPI.SUM)
     r2 += r2_loc
 
     r1_loc = None
@@ -204,8 +290,8 @@ def intermediates_t3_add_t3_tri(mycc, imds, t3):
                 t3_tmp, out=W_vvvo_loc[:, :, :, pj], alpha=-1.0, beta=1.0)
     t3_tmp = None
 
-    mycc.comm.Allreduce(MPI.IN_PLACE, W_vooo_loc, op=MPI.SUM)
-    mycc.comm.Allreduce(MPI.IN_PLACE, W_vvvo_loc, op=MPI.SUM)
+    _allreduce_inplace_mpi_rccsdt(mycc, W_vooo_loc, 'W_vooo_t3', op=MPI.SUM)
+    _allreduce_inplace_mpi_rccsdt(mycc, W_vvvo_loc, 'W_vvvo_t3', op=MPI.SUM)
 
     W_vooo += W_vooo_loc
     W_vvvo += W_vvvo_loc
@@ -219,7 +305,7 @@ def compute_r3_tri(mycc, imds, t2, t3):
     MPI communication is performed to gather the contributions from distributed T3 amplitudes.
     '''
     time1 = logger.process_clock(), logger.perf_counter()
-    log = contraction_logger(mycc, 'log_t3_contractions', 'log_t3_contractions_all_ranks')
+    log = contraction_logger(mycc)
     memlog = memory_logger(mycc)
     log_memory(mycc, memlog, 'compute r3 start')
 
@@ -228,8 +314,7 @@ def compute_r3_tri(mycc, imds, t2, t3):
     F_vv, W_vooo, W_vvvo, W_vvvv = imds.F_vv, imds.W_vooo, imds.W_vvvo, imds.W_vvvv
 
     r3_local = np.empty_like(t3_local)
-    if mycc.rank == 0:
-        time2 = logger.process_clock(), logger.perf_counter()
+    time2 = logger.process_clock(), logger.perf_counter()
     log_memory(mycc, memlog, 'r3 buffers allocated')
     for i, j, k, local_idx in dt3.iter_local_ijk():
         r3_tmp = r3_local[local_idx]
@@ -249,46 +334,42 @@ def compute_r3_tri(mycc, imds, t2, t3):
         einsum('ad,dbc->abc', F_vv, t3_tmp, out=r3_tmp, alpha=1.0, beta=1.0)
         einsum('bd,adc->abc', F_vv, t3_tmp, out=r3_tmp, alpha=1.0, beta=1.0)
         einsum('cd,abd->abc', F_vv, t3_tmp, out=r3_tmp, alpha=1.0, beta=1.0)
-        if mycc.rank == 0:
-            time2 = log.timer_debug1('t3: iter: W_vvvo, W_vooo, F_vv %3d:'%(local_idx), *time2)
+        time2 = log.timer_debug1(
+            contraction_message(mycc, 't3: iter: W_vvvo, W_vooo, F_vv %3d:' % (local_idx)),
+            *time2)
     F_vv = imds.F_vv = None
     W_vooo = imds.W_vooo = None
     W_vvvo = imds.W_vvvo = None
 
     log_memory(mycc, memlog, 'r3 W_vvvo/W_vooo/F_vv contractions')
-    if mycc.rank == 0:
-        time1 = log.timer_debug1('t3: W_vvvo * t2, W_vooo * t2, F_vv * t3', *time1)
+    time1 = log.timer_debug1(contraction_message(mycc, 't3: W_vvvo * t2, W_vooo * t2, F_vv * t3'), *time1)
     mycc.comm.Barrier()
 
     compute_oooo_oovv_contraction_(mycc, imds, t3, r3_local)
 
     log_memory(mycc, memlog, 'r3 W_ovov/W_oooo contractions')
-    if mycc.rank == 0:
-        time1 = log.timer_debug1('t3: W_ovov * t3, W_oooo * t3', *time1)
+    time1 = log.timer_debug1(contraction_message(mycc, 't3: W_ovov * t3, W_oooo * t3'), *time1)
     mycc.comm.Barrier()
 
-    if mycc.rank == 0:
-        time2 = logger.process_clock(), logger.perf_counter()
+    time2 = logger.process_clock(), logger.perf_counter()
     for i, j, k, local_idx in dt3.iter_local_ijk():
         t3_tmp_s = t3_local[local_idx]
         r3_tmp_s = r3_local[local_idx]
         einsum('abde,dec->abc', W_vvvv, t3_tmp_s, out=r3_tmp_s, alpha=1.0, beta=1.0)
         einsum('acde,dbe->abc', W_vvvv, t3_tmp_s, out=r3_tmp_s, alpha=1.0, beta=1.0)
         einsum('bcde,ade->abc', W_vvvv, t3_tmp_s, out=r3_tmp_s, alpha=1.0, beta=1.0)
-        if mycc.rank == 0:
-            time2 = log.timer_debug1('t3: iter: W_vvvv %3d:'%local_idx, *time2)
+        time2 = log.timer_debug1(contraction_message(mycc, 't3: iter: W_vvvv %3d:' % local_idx), *time2)
     W_vvvv = imds.W_vvvv = None
 
     log_memory(mycc, memlog, 'r3 W_vvvv contractions')
-    if mycc.rank == 0:
-        time1 = log.timer_debug1('t3: W_vvvv * t3', *time1)
+    time1 = log.timer_debug1(contraction_message(mycc, 't3: W_vvvv * t3'), *time1)
     mycc.comm.Barrier()
     return r3_local
 
 def compute_oooo_oovv_contraction_(mycc, imds, t3, r3_local):
     '''r3_local is updated in place.
     '''
-    log = contraction_logger(mycc, 'log_t3_contractions', 'log_t3_contractions_all_ranks')
+    log = contraction_logger(mycc)
     memlog = memory_logger(mycc)
     log_memory(mycc, memlog, 'OO T3 contraction start')
 
@@ -318,8 +399,7 @@ def compute_oooo_oovv_contraction_(mycc, imds, t3, r3_local):
     t3_tmp_p3_v1 = np.empty((nvir,) * 3, dtype=t3_local.dtype)
     t3_tmp_p3_v2 = np.empty((nvir,) * 3, dtype=t3_local.dtype)
     t3_tmp_2 = np.empty((nvir,) * 3, dtype=t3_local.dtype)
-    if mycc.rank == 0:
-        time2 = logger.process_clock(), logger.perf_counter()
+    time2 = logger.process_clock(), logger.perf_counter()
 
     # Build list of batch ranges
     batches = []
@@ -337,7 +417,9 @@ def compute_oooo_oovv_contraction_(mycc, imds, t3, r3_local):
             batch_start, batch_end = batches[0]
             batch_ijk = ijk_list[batch_start:batch_end]
             if mycc.size > 1:
-                handle = dt3.prefetch_t3_triples_iallgather(t3_local, batch_ijk)
+                handle = dt3.prefetch_t3_triples_iallgather(
+                    t3_local, batch_ijk, batch_index=1,
+                    batch_start=batch_start, batch_end=batch_end)
                 if progress_thread is not None and handle:
                     progress_thread.add_requests(handle.get('reqs', ()))
 
@@ -351,7 +433,9 @@ def compute_oooo_oovv_contraction_(mycc, imds, t3, r3_local):
                 next_start, next_end = batches[i_batch + 1]
                 next_batch_ijk = ijk_list[next_start:next_end]
                 if mycc.size > 1:
-                    handle_next = dt3.prefetch_t3_triples_iallgather(t3_local, next_batch_ijk)
+                    handle_next = dt3.prefetch_t3_triples_iallgather(
+                        t3_local, next_batch_ijk, batch_index=i_batch + 2,
+                        batch_start=next_start, batch_end=next_end)
                     if progress_thread is not None and handle_next:
                         progress_thread.add_requests(handle_next.get('reqs', ()))
 
@@ -442,8 +526,9 @@ def compute_oooo_oovv_contraction_(mycc, imds, t3, r3_local):
                         einsum('ad,cdb->abc', W_ovov[o00, :, k, :], t3_tmp, out=r3_tmp, alpha=-1.0, beta=1.0)
                         einsum('cd,adb->abc', W_ovov[o00, :, k, :], t3_tmp_2, out=r3_tmp, alpha=-0.5, beta=1.0)
                         einsum('cd,dab->abc', W_ovvo[o00, :, :, k], t3_tmp_p3_v2, out=r3_tmp, alpha=0.5, beta=1.0)
-            if mycc.rank == 0:
-                time2 = log.timer_debug1('t3: iter: W_ovov, W_oooo %4d, %4d:'%(batch_start, batch_end), *time2)
+            time2 = log.timer_debug1(
+                contraction_message(mycc, 't3: iter: W_ovov, W_oooo %4d, %4d:' % (batch_start, batch_end)),
+                *time2)
             log_memory(mycc, memlog, 'OO T3 batch %4d:%4d' % (batch_start, batch_end), per_iter=True)
             # Advance handle
             handle = handle_next
@@ -778,7 +863,7 @@ def update_amps_rccsdt_tri_(mycc, tamps, eris):
     else:
         r3_active_norm_sq_local = r3_norm_sq_local
     r3_norms = np.array([r3_norm_sq_local, r3_active_norm_sq_local], dtype=np.float64)
-    mycc.comm.Allreduce(MPI.IN_PLACE, r3_norms, op=MPI.SUM)
+    _allreduce_inplace_mpi_rccsdt(mycc, r3_norms, 'r3_norms', op=MPI.SUM)
     r3_norm_sq = float(r3_norms[0])
     mycc._last_t3_residual_norm_sq = r3_norm_sq
     mycc._last_t3_active_residual_norm_sq = float(r3_norms[1])
@@ -894,6 +979,7 @@ def kernel(mycc, eris=None, tamps=None, tol=1e-8, tolnormt=1e-6, max_cycle=50, v
     else:
         if len(tamps) < mycc.cc_order:
             tamps = list(tamps) + list(mycc.init_amps(eris)[1][len(tamps):])
+    configure_t3_runtime_logging(mycc, tamps)
 
     name = mycc.__class__.__name__
 
@@ -959,6 +1045,7 @@ def kernel(mycc, eris=None, tamps=None, tol=1e-8, tolnormt=1e-6, max_cycle=50, v
     if mycc.rank == 0:
         log.timer(name, *cput0)
 
+    close_t3_runtime_logging(tamps)
     return converged, e_corr, tamps
 
 def _update_procs_mf(comm, mf):
@@ -988,12 +1075,14 @@ class RCCSDT(ccsd.CCSDBase):
     diis_scratch_mmap = getattr(__config__, 'cc_rccsdt_RCCSDT_diis_scratch_mmap', False)
     allow_python_fallback = getattr(__config__, 'cc_rccsdt_RCCSDT_allow_python_fallback', False)
     log_highest_t_communication = getattr(__config__, 'cc_rccsdt_RCCSDT_log_highest_t_communication', False)
+    communication_log_dir = getattr(__config__, 'cc_rccsdt_RCCSDT_communication_log_dir', 'comm_logs')
     log_highest_t_contractions = getattr(__config__, 'cc_rccsdt_RCCSDT_log_highest_t_contractions', False)
     log_highest_t_contractions_all_ranks = getattr(__config__,
                                                    'cc_rccsdt_RCCSDT_log_highest_t_contractions_all_ranks', False)
+    contraction_log_dir = getattr(__config__, 'cc_rccsdt_RCCSDT_contraction_log_dir', 'contraction_logs')
     log_allreduce_timing = getattr(__config__, 'cc_rccsdt_RCCSDT_log_allreduce_timing', False)
     log_memory = getattr(__config__, 'cc_rccsdt_RCCSDT_log_memory', False)
-    log_memory_all_ranks = getattr(__config__, 'cc_rccsdt_RCCSDT_log_memory_all_ranks', True)
+    log_memory_all_ranks = getattr(__config__, 'cc_rccsdt_RCCSDT_log_memory_all_ranks', False)
     log_memory_per_iter = getattr(__config__, 'cc_rccsdt_RCCSDT_log_memory_per_iter', False)
     # Keep MPI calls on the main thread by default.  The helper progress thread
     # can deadlock some OpenMPI nonblocking collective workloads.
@@ -1012,8 +1101,10 @@ class RCCSDT(ccsd.CCSDBase):
         'size', 'rank', 'comm', 'batch_size', 'nvir_diis',
         'diis_scratch', 'diis_scratch_start', 'diis_scratch_cleanup', 'diis_scratch_mmap',
         'allow_python_fallback',
-        'log_highest_t_communication', 'log_highest_t_contractions', 'log_highest_t_contractions_all_ranks',
-        'log_allreduce_timing', 'log_memory', 'log_memory_all_ranks', 'log_memory_per_iter',
+        'log_highest_t_communication', 'communication_log_dir',
+        'log_highest_t_contractions', 'log_highest_t_contractions_all_ranks',
+        'contraction_log_dir', 'log_allreduce_timing',
+        'log_memory', 'log_memory_all_ranks', 'log_memory_per_iter',
         'use_mpi_progress_thread', 'mpi_progress_poll_interval', 'gil_punctuate_duration',
         'gil_punctuate_interval'
     }

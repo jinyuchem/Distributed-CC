@@ -18,8 +18,10 @@
 #
 
 import sys
+import csv
 import gc
 import functools
+import os
 import numpy as np
 from pyscf import lib
 from pyscf.lib import logger
@@ -35,7 +37,7 @@ from distr_cc._rccsdtq_core import t4_add_
 from distr_cc._c_rccsdt_q import (e_abcdijkl_division_, fill_t3_from_ptr_array, pack_t3_indices_, promote_t3_blocks_,
                                 t4_spin_summation_inplace_, t4_multiply_factor_)
 from distr_cc._mpi import punctuate_mpi_progress, start_mpi_progress_thread
-from distr_cc._runtime import log_memory, memory_logger, warn_non_pytblis_backend
+from distr_cc._runtime import contraction_logger, log_memory, memory_logger, warn_non_pytblis_backend
 
 def prepare_t2_for_q(mycc, t2):
     nocc, nmo = mycc.nocc, mycc.nmo
@@ -47,17 +49,23 @@ def prepare_t2_for_q(mycc, t2):
     raise ValueError("RCCSDT(Q) expected T2 with shape (nocc,nocc,nvir,nvir) "
                     "or prepared shape (nvir,nvir,nocc,nocc); got %s" % (t2.shape,))
 
-def redistribute_t3_ijk_to_abc(dt3_ijk, t3_local_ijk, comm, blksize_abc=None, chunk_size=None):
+def redistribute_t3_ijk_to_abc(dt3_ijk, t3_local_ijk, comm, blksize_abc=None, chunk_size=None,
+                                log_redistribution=True, verbose=None, stdout=None):
     from distr_cc.distribute_t3 import redistribute_ijk_to_abc
-    return redistribute_ijk_to_abc(dt3_ijk, t3_local_ijk, comm, blksize_abc=blksize_abc, chunk_size=chunk_size)
+    return redistribute_ijk_to_abc(dt3_ijk, t3_local_ijk, comm, blksize_abc=blksize_abc,
+                                   chunk_size=chunk_size, log_redistribution=log_redistribution,
+                                   verbose=verbose, stdout=stdout)
 
-def prepare_t3_for_q(t3, comm=None, blksize=4, chunk_size=None):
+def prepare_t3_for_q(t3, comm=None, blksize=4, chunk_size=None, log_redistribution=True,
+                    verbose=None, stdout=None):
     if comm is None:
         comm = MPI.COMM_WORLD
     dt3, t3_local = t3
     if hasattr(dt3, 'abc_to_global_idx'):
         return t3
-    return redistribute_t3_ijk_to_abc(dt3, t3_local, comm, blksize_abc=blksize, chunk_size=chunk_size)
+    return redistribute_t3_ijk_to_abc(dt3, t3_local, comm, blksize_abc=blksize,
+                                      chunk_size=chunk_size, log_redistribution=log_redistribution,
+                                      verbose=verbose, stdout=stdout)
 
 def _replace_t3_reference(tamps, old_t3, new_t3):
     if tamps is None:
@@ -70,7 +78,8 @@ def _replace_t3_reference(tamps, old_t3, new_t3):
         pass
     return False
 
-def prepare_tamps_for_q(mycc, tamps=None, blksize=4, comm=None, chunk_size=None, release_ijk_t3=True):
+def prepare_tamps_for_q(mycc, tamps=None, blksize=4, comm=None, chunk_size=None,
+                        release_ijk_t3=True, log_redistribution=True):
     if tamps is None:
         tamps = mycc.tamps
     if len(tamps) < 3:
@@ -79,7 +88,10 @@ def prepare_tamps_for_q(mycc, tamps=None, blksize=4, comm=None, chunk_size=None,
         comm = getattr(mycc, 'comm', MPI.COMM_WORLD)
     t1, t2, t3 = tamps[:3]
     t2_q = prepare_t2_for_q(mycc, t2)
-    t3_q = prepare_t3_for_q(t3, comm=comm, blksize=blksize, chunk_size=chunk_size)
+    t3_q = prepare_t3_for_q(t3, comm=comm, blksize=blksize, chunk_size=chunk_size,
+                            log_redistribution=log_redistribution,
+                            verbose=getattr(mycc, 'verbose', None),
+                            stdout=getattr(mycc, 'stdout', None))
     if release_ijk_t3 and t3_q is not t3:
         replaced = _replace_t3_reference(tamps, t3, t3_q)
         mycc_tamps = getattr(mycc, 'tamps', None)
@@ -136,12 +148,11 @@ def memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, n_tasks=None, local_
 
     max_memory = mycc.max_memory - lib.current_memory()[0]
     if (total_memory / 1024**2) > max_memory:
-        logger.warn(mycc, 'Estimated per-rank memory %.2f MB exceeds available %.2f MB',
-                    total_memory / 1024**2, max_memory)
+        logger.warn(mycc, 'Estimated per-rank memory %.2f MB exceeds available %.2f MB', total_memory / 1024**2, max_memory)
     return mycc
 
 
-def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=1, release_ijk_t3=True):
+def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=1, release_ijk_t3=False, log_redistribution=False):
     '''Compute [Q] and (Q) correction terms using the ABC-based algorithm.
     Offsets and tasks are determined by job_idx/n_jobs for job splitting.'''
     time0 = logger.process_clock(), logger.perf_counter()
@@ -161,9 +172,12 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     memlog = memory_logger(mycc)
     warn_non_pytblis_backend(mycc, "RCCSDT(Q)")
     progress_thread = start_mpi_progress_thread(mycc)
-    comm_log = logger.Logger(mycc.stdout, logger.DEBUG if (rank == 0 and getattr(mycc, "log_highest_t_communication", False)) else 0)
-    detail_log = logger.Logger(mycc.stdout, logger.DEBUG1 if (getattr(mycc, "log_highest_t_contractions", False)
-                            and (rank == 0 or getattr(mycc, "log_highest_t_contractions_all_ranks", False))) else 0)
+    log_contractions = getattr(mycc, "log_highest_t_contractions", False)
+    log_contractions_all_ranks = getattr(mycc, "log_highest_t_contractions_all_ranks", False)
+    log_all_rank_contractions = log_contractions and log_contractions_all_ranks
+    log_communication = getattr(mycc, "log_highest_t_communication", False)
+    detail_log = contraction_logger(mycc)
+    log_task_energies = log_all_rank_contractions
 
     backend = mycc.einsum_backend
     einsum = functools.partial(_einsum, backend)
@@ -172,7 +186,9 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     nvir = nmo - nocc
 
     log_memory(mycc, memlog, 'RCCSDT(Q) Before T_IJK -> T_ABC')
-    _, t2, t3 = prepare_tamps_for_q(mycc, tamps=tamps, blksize=blksize, comm=comm, release_ijk_t3=release_ijk_t3)
+    _, t2, t3 = prepare_tamps_for_q(mycc, tamps=tamps, blksize=blksize, comm=comm,
+                                    release_ijk_t3=release_ijk_t3,
+                                    log_redistribution=log_redistribution)
     dt3, t3_local = t3
     log_memory(mycc, memlog, 'RCCSDT(Q) After T_IJK -> T_ABC')
 
@@ -450,6 +466,99 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
         return tuple(np.concatenate(chunks) if chunks else empty_index_array for chunks in needed_chunks)
 
     persistent_buffers = {'recv': [None, None], 'send': [None, None], 'idx': 0}
+    comm_log_fields = (
+        'job_idx', 'n_jobs', 'task', 'rank', 'active',
+        'issue_total', 'prefetch_total', 'waitall', 'unpack', 'finalize_total',
+        'need_expand', 'need_scan', 'promote_copy',
+        'send_plan', 'send_lookup', 'send_prune',
+        'recv_setup', 'recv_post', 'send_setup', 'send_pack', 'send_post',
+        'local_needed', 'stable_hits', 'promoted_hits', 'recv_blocks', 'send_blocks',
+    )
+    comm_log_file = None
+    comm_log_writer = None
+    if log_communication:
+        comm_log_dir = getattr(mycc, 'communication_log_dir', 'comm_logs')
+        comm_log_dir = os.path.expanduser(os.path.expandvars(str(comm_log_dir or 'comm_logs')))
+        os.makedirs(comm_log_dir, exist_ok=True)
+        comm_log_path = os.path.join(comm_log_dir, 'rccsdt_q_comm_job%03d_of%03d_rank%04d.csv' % (job_idx, n_jobs, rank))
+        comm_log_file = open(comm_log_path, 'w', newline='')
+        comm_log_writer = csv.DictWriter(comm_log_file, fieldnames=comm_log_fields)
+        comm_log_writer.writeheader()
+        comm_log_file.flush()
+
+    task_energy_log_fields = ('job_idx', 'n_jobs', 'task', 'global_task', 'rank',
+                                'a0', 'a1', 'b0', 'b1', 'c0', 'c1', 'd0', 'd1', 'q_bracket', 'q_paren')
+    task_energy_log_file = None
+    task_energy_log_writer = None
+    if log_task_energies:
+        task_energy_log_dir = getattr(mycc, 'contraction_log_dir', 'contraction_logs')
+        task_energy_log_dir = os.path.expanduser(os.path.expandvars(str(task_energy_log_dir or 'contraction_logs')))
+        os.makedirs(task_energy_log_dir, exist_ok=True)
+        task_energy_log_path = os.path.join(task_energy_log_dir,
+                                    'rccsdt_q_contractions_job%03d_of%03d_rank%04d.csv' % (job_idx, n_jobs, rank))
+        task_energy_log_file = open(task_energy_log_path, 'w', newline='')
+        task_energy_log_writer = csv.DictWriter(task_energy_log_file, fieldnames=task_energy_log_fields)
+        task_energy_log_writer.writeheader()
+        task_energy_log_file.flush()
+
+    def new_comm_metrics(task_index, task):
+        return {
+            'job_idx': int(job_idx),
+            'n_jobs': int(n_jobs),
+            'task': int(task_index + 1),
+            'rank': int(rank),
+            'active': int(task is not None),
+            'issue_total': 0.0,
+            'prefetch_total': 0.0,
+            'waitall': 0.0,
+            'unpack': 0.0,
+            'finalize_total': 0.0,
+            'need_expand': 0.0,
+            'need_scan': 0.0,
+            'promote_copy': 0.0,
+            'send_plan': 0.0,
+            'send_lookup': 0.0,
+            'send_prune': 0.0,
+            'recv_setup': 0.0,
+            'recv_post': 0.0,
+            'send_setup': 0.0,
+            'send_pack': 0.0,
+            'send_post': 0.0,
+            'local_needed': 0,
+            'stable_hits': 0,
+            'promoted_hits': 0,
+            'recv_blocks': 0,
+            'send_blocks': 0,
+        }
+
+    def log_comm_metrics(metrics):
+        if comm_log_writer is None:
+            return
+        comm_log_writer.writerow({key: metrics[key] for key in comm_log_fields})
+        comm_log_file.flush()
+
+    def log_task_energy(task_index, task, q_bracket, q_paren):
+        if task_energy_log_writer is None:
+            return
+        a0, a1, _, b0, b1, _, c0, c1, _, d0, d1, _ = task
+        task_energy_log_writer.writerow({
+            'job_idx': int(job_idx),
+            'n_jobs': int(n_jobs),
+            'task': int(task_index + 1),
+            'global_task': int(start_job + my_start + task_index + 1),
+            'rank': int(rank),
+            'a0': int(a0),
+            'a1': int(a1),
+            'b0': int(b0),
+            'b1': int(b1),
+            'c0': int(c0),
+            'c1': int(c1),
+            'd0': int(d0),
+            'd1': int(d1),
+            'q_bracket': float(q_bracket),
+            'q_paren': float(q_paren),
+        })
+        task_energy_log_file.flush()
 
     def prefetch_task(task_index, task, prev_state=None):
         """
@@ -457,6 +566,7 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
         and a stable per-index remote cache for overlapping remote fragments.
         """
         t_prefetch_total = logger.perf_counter()
+        metrics = new_comm_metrics(task_index, task)
         pidx = persistent_buffers['idx']
         persistent_buffers['idx'] = 1 - persistent_buffers['idx']
 
@@ -683,32 +793,44 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
             'stable_remote_buffers': current_stable_remote_buffers,
             'promote_buf_master': promote_buf,
             'recv_buf_master': recv_buf,
-            'send_buf_master': send_buf
+            'send_buf_master': send_buf,
+            'metrics': metrics,
         }
 
         total_prefetch_time = logger.perf_counter() - t_prefetch_total
-        comm_log.debug(
-            f"        Rank {rank} Task {task_index+1}: prefetch breakdown total={total_prefetch_time:.4f} sec "
-            f"need_expand={t_need_expand:.4f} need_scan={t_need_scan:.4f} "
-            f"promote_copy={t_promote_copy:.4f} "
-            f"send_plan={t_send_plan:.4f} (lookup={t_send_lookup:.4f} prune={t_send_prune:.4f}) "
-            f"recv_setup={t_recv_setup:.4f} recv_post={t_recv_post:.4f} "
-            f"send_setup={t_send_setup:.4f} send_pack={t_send_pack:.4f} send_post={t_send_post:.4f} "
-            f"local_needed={n_local_needed} stable_hits={n_remote_stable_hits} promoted_hits={n_remote_promoted_hits} "
-            f"recv_blocks={total_recv_blocks} send_blocks={total_send_blocks}"
-        )
+        metrics.update({
+            'prefetch_total': total_prefetch_time,
+            'need_expand': t_need_expand,
+            'need_scan': t_need_scan,
+            'promote_copy': t_promote_copy,
+            'send_plan': t_send_plan,
+            'send_lookup': t_send_lookup,
+            'send_prune': t_send_prune,
+            'recv_setup': t_recv_setup,
+            'recv_post': t_recv_post,
+            'send_setup': t_send_setup,
+            'send_pack': t_send_pack,
+            'send_post': t_send_post,
+            'local_needed': int(n_local_needed),
+            'stable_hits': int(n_remote_stable_hits),
+            'promoted_hits': int(n_remote_promoted_hits),
+            'recv_blocks': int(total_recv_blocks),
+            'send_blocks': int(total_send_blocks),
+        })
         if progress_thread is not None:
             progress_thread.add_requests(mpi_requests)
         return prefetch_handle
 
     def finalize_prefetch_task(handle):
         if not handle:
-            return {'buffers': {}, 'stable_remote_buffers': {}}
+            return {'buffers': {}, 'stable_remote_buffers': {}, 'metrics': new_comm_metrics(ti, None)}
+        t_finalize = logger.perf_counter()
+        metrics = handle['metrics']
         t0_wait = logger.perf_counter()
         if progress_thread is not None:
             progress_thread.clear_requests()
         MPI.Request.Waitall(handle['requests'])
-        comm_log.debug(f"        Rank {rank} Task {ti+1}: MPI.Waitall time: {logger.perf_counter()-t0_wait:.4f} sec.")
+        metrics['waitall'] = logger.perf_counter() - t0_wait
         t0_wait = logger.perf_counter()
 
         req_by_owner = handle['req_by_owner']
@@ -722,8 +844,10 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
                 for i, abc_idx in enumerate(indices):
                     current_buffers[abc_idx] = buf[i]
 
-        comm_log.debug(f"        Rank {rank} Task {ti+1}: Unpack time: {logger.perf_counter()-t0_wait:.4f} sec.")
-        return {'buffers': current_buffers, 'stable_remote_buffers': current_stable_remote_buffers}
+        metrics['unpack'] = logger.perf_counter() - t0_wait
+        metrics['finalize_total'] = logger.perf_counter() - t_finalize
+        return {'buffers': current_buffers, 'stable_remote_buffers': current_stable_remote_buffers,
+                'metrics': metrics}
 
     if rank == 0:
         log.info("Starting RCCSDT(Q) correction computation with ABC-based algorithm (Single Task Deterministic)...")
@@ -757,7 +881,9 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     # Initial Prefetch (Task 0)
     next_handle = None
     first_task = my_tasks[0] if tasks_len > 0 else None
+    t0_issue = logger.perf_counter()
     next_handle = prefetch_task(0, first_task, None) # Prefetch task 0
+    next_handle['metrics']['issue_total'] = logger.perf_counter() - t0_issue
 
     for ti in range(global_max_tasks):
 
@@ -767,7 +893,8 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
         t0_wait = logger.perf_counter()
         task_state = finalize_prefetch_task(next_handle)
         task_buffers = task_state['buffers']
-        comm_log.debug(f"    Rank {rank} Task {ti+1}: prefetch finalize time: {logger.perf_counter()-t0_wait:.4f} sec.")
+        task_state['metrics']['finalize_total'] = logger.perf_counter() - t0_wait
+        log_comm_metrics(task_state['metrics'])
 
         # 2. Prefetch Next
         future_handle = None
@@ -777,7 +904,7 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
             t0_issue = logger.perf_counter()
             # Reuse buffers from previous task if possible
             future_handle = prefetch_task(ti + 1, next_task, task_state)
-            comm_log.debug(f"    Rank {rank} Task {ti+1}: prefetch issue time: {logger.perf_counter()-t0_issue:.4f} sec.")
+            future_handle['metrics']['issue_total'] = logger.perf_counter() - t0_issue
 
         # 3. Compute
         if ti < tasks_len:
@@ -795,8 +922,6 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
 
             (a0, a1, ba, b0, b1, bb, c0, c1, bc, d0, d1, bd) = task
             detail_log.debug(f"    Rank {rank} show task {ti+1}: a[{a0}:{a1}] b[{b0}:{b1}] c[{c0}:{c1}] d[{d0}:{d1}]")
-            detail_log.debug(f"    Rank {rank} memory used: {lib.current_memory()[0]} MB")
-            detail_log.debug(f"    Rank {rank} memory available: {mycc.max_memory - lib.current_memory()[0]} MB")
 
             fill_t3_p2p(t3_blks[0], a0, a1, b0, b1, task_buffers)
             punctuate_mpi_progress(mycc, progress_thread)
@@ -940,8 +1065,7 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
             tmp_bracket = np.dot(t4_blk.ravel(), z4_p_blk.ravel()) / 12.0
             tmp_paren += tmp_bracket
 
-            detail_log.debug1(f"[Q] Task {ti+1} Rank {rank} A[{a0:3d}:{a1:3d}] B[{b0:3d}:{b1:3d}] C[{c0:3d}:{c1:3d}] D[{d0:3d}:{d1:3d}]: {tmp_bracket: .16e}")
-            detail_log.debug1(f"(Q) Task {ti+1} Rank {rank} A[{a0:3d}:{a1:3d}] B[{b0:3d}:{b1:3d}] C[{c0:3d}:{c1:3d}] D[{d0:3d}:{d1:3d}]: {tmp_paren: .16e}")
+            log_task_energy(ti, task, tmp_bracket, tmp_paren)
             log_memory(mycc, memlog, 'RCCSDT(Q) task %d' % (ti + 1), per_iter=True)
 
             e_q_bracket += tmp_bracket
@@ -972,6 +1096,10 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
 
     if progress_thread is not None:
         progress_thread.stop()
+    if comm_log_file is not None:
+        comm_log_file.close()
+    if task_energy_log_file is not None:
+        task_energy_log_file.close()
     return e_q_bracket, e_q_paren
 
 
