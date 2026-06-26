@@ -1020,7 +1020,7 @@ if __name__ == '__main__':
     q_paren = -0.001620887567
 
     mycc.verbose = 8
-    q_bracket, q_paren = kernel(mycc, tamps=tamps, blksize=8, comm=comm, job_idx=0, n_jobs=1)
+    q_bracket, q_paren = kernel(mycc, tamps=tamps, blksize=8, comm=comm, job_idx=0, n_jobs=1, release_ijk_t3=False)
     if rank == 0:
         print('SQ corr: % .12f    Ref: % .12f    Diff: % .12e'%(q_bracket, q_bracket, q_bracket - q_bracket))
         print('PQ corr: % .12f    Ref: % .12f    Diff: % .12e'%(q_paren, q_paren, q_paren - q_paren))

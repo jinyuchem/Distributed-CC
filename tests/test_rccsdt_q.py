@@ -49,21 +49,21 @@ def tearDownModule():
 
 class KnownValues(unittest.TestCase):
     def test_rccsdt_q(self):
-        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc)
+        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, release_ijk_t3=False)
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
         self.assertAlmostEqual(e_q_paren, EXPECTED_PAREN_Q_ENERGY, 10)
 
     def test_blksize(self):
-        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, blksize=2)
+        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, blksize=2, release_ijk_t3=False)
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
         self.assertAlmostEqual(e_q_paren, EXPECTED_PAREN_Q_ENERGY, 10)
-        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, blksize=3)
+        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, blksize=3, release_ijk_t3=False)
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
         self.assertAlmostEqual(e_q_paren, EXPECTED_PAREN_Q_ENERGY, 10)
-        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, blksize=4)
+        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, blksize=4, release_ijk_t3=False)
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
         self.assertAlmostEqual(e_q_paren, EXPECTED_PAREN_Q_ENERGY, 10)
-        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, blksize=7)
+        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc, blksize=7, release_ijk_t3=False)
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
         self.assertAlmostEqual(e_q_paren, EXPECTED_PAREN_Q_ENERGY, 10)
 
@@ -71,7 +71,7 @@ class KnownValues(unittest.TestCase):
         njobs = 3
         e_q_bracket, e_q_paren = 0.0, 0.0
         for i in range(njobs):
-            tmp1, tmp2 = rccsdt_q.kernel(mcc, blksize=4, job_idx=i, n_jobs=njobs)
+            tmp1, tmp2 = rccsdt_q.kernel(mcc, blksize=4, job_idx=i, n_jobs=njobs, release_ijk_t3=False)
             e_q_bracket += tmp1
             e_q_paren += tmp2
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
@@ -79,7 +79,7 @@ class KnownValues(unittest.TestCase):
         njobs = 9
         e_q_bracket, e_q_paren = 0.0, 0.0
         for i in range(njobs):
-            tmp1, tmp2 = rccsdt_q.kernel(mcc, blksize=6, job_idx=i, n_jobs=njobs)
+            tmp1, tmp2 = rccsdt_q.kernel(mcc, blksize=6, job_idx=i, n_jobs=njobs, release_ijk_t3=False)
             e_q_bracket += tmp1
             e_q_paren += tmp2
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
@@ -87,7 +87,7 @@ class KnownValues(unittest.TestCase):
         njobs = 13
         e_q_bracket, e_q_paren = 0.0, 0.0
         for i in range(njobs):
-            tmp1, tmp2 = rccsdt_q.kernel(mcc, blksize=3, job_idx=i, n_jobs=njobs)
+            tmp1, tmp2 = rccsdt_q.kernel(mcc, blksize=3, job_idx=i, n_jobs=njobs, release_ijk_t3=False)
             e_q_bracket += tmp1
             e_q_paren += tmp2
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
@@ -97,7 +97,7 @@ class KnownValues(unittest.TestCase):
         mcc2 = rccsdt.RCCSDT(rhf, comm=MPI.COMM_WORLD)
         tamps = mcc.tamps
         eris = mcc2.ao2mo()
-        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc2, tamps=tamps, eris=eris)
+        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc2, tamps=tamps, eris=eris, release_ijk_t3=False)
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
         self.assertAlmostEqual(e_q_paren, EXPECTED_PAREN_Q_ENERGY, 10)
 

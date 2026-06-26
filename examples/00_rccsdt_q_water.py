@@ -51,7 +51,7 @@ mycc.kernel()
 q_bracket, q_paren = 0.0, 0.0
 njobs = 4
 for i in range(njobs):
-    tmp1, tmp2 = rccsdt_q.kernel(mycc, comm=comm, blksize=4, job_idx=i, n_jobs=njobs)
+    tmp1, tmp2 = rccsdt_q.kernel(mycc, comm=comm, blksize=4, job_idx=i, n_jobs=njobs, release_ijk_t3=False)
     q_bracket += tmp1
     q_paren += tmp2
 
