@@ -85,9 +85,9 @@ If you use GNU compilers, `g++` 10 or newer is required for the symmetrized tens
 Run examples with `mpirun`:
 
 ```bash
-mpirun -n 4 python examples/01_rccsdt_water.py
-mpirun -n 4 python examples/02_rccsdt_q_water.py
-mpirun -n 4 python examples/03_rccsdtq_water.py
+mpirun -n 4 python examples/00_rccsdt_q_water.py
+mpirun -n 4 python examples/01_rccsdtq_water.py
+mpirun -n 4 python examples/02_restart.py
 ```
 
 Minimal example:
@@ -126,7 +126,7 @@ einsum backend before running the kernel:
 mycc.set_einsum_backend("pytblis")
 ```
 
-## Python Fallbacks
+<!-- ## Python Fallbacks
 
 Python fallbacks for native helper kernels are intended for debugging only.
 They are disabled by default. To allow them explicitly, set either:
@@ -135,4 +135,4 @@ They are disabled by default. To allow them explicitly, set either:
 export DISTR_CC_ALLOW_PYTHON_FALLBACK=1
 ```
 
-or set `allow_python_fallback = True` on the relevant driver object.
+or set `allow_python_fallback = True` on the relevant driver object. -->
