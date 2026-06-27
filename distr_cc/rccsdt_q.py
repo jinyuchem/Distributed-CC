@@ -67,19 +67,20 @@ def prepare_t3_for_q(t3, comm=None, blksize=4, chunk_size=None, log_redistributi
                                       chunk_size=chunk_size, log_redistribution=log_redistribution,
                                       verbose=verbose, stdout=stdout)
 
-def _replace_t3_reference(tamps, old_t3, new_t3):
-    if tamps is None:
-        return False
+def _t3_local_nbytes(t3):
     try:
-        if len(tamps) > 2 and tamps[2] is old_t3:
-            tamps[2] = new_t3
-            return True
-    except (TypeError, AttributeError):
-        pass
-    return False
+        return int(getattr(t3[1], 'nbytes', 0))
+    except Exception:
+        return 0
+
+def _is_abc_distributed_t3(t3):
+    try:
+        return hasattr(t3[0], 'abc_to_global_idx')
+    except Exception:
+        return False
 
 def prepare_tamps_for_q(mycc, tamps=None, blksize=4, comm=None, chunk_size=None,
-                        release_ijk_t3=True, log_redistribution=True):
+                        log_redistribution=True):
     if tamps is None:
         tamps = mycc.tamps
     if len(tamps) < 3:
@@ -92,22 +93,13 @@ def prepare_tamps_for_q(mycc, tamps=None, blksize=4, comm=None, chunk_size=None,
                             log_redistribution=log_redistribution,
                             verbose=getattr(mycc, 'verbose', None),
                             stdout=getattr(mycc, 'stdout', None))
-    if release_ijk_t3 and t3_q is not t3:
-        replaced = _replace_t3_reference(tamps, t3, t3_q)
-        mycc_tamps = getattr(mycc, 'tamps', None)
-        if mycc_tamps is not tamps:
-            replaced = _replace_t3_reference(mycc_tamps, t3, t3_q) or replaced
-        t3 = None
-        if replaced:
-            gc.collect()
     return [t1, t2_q, t3_q]
 
-def memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, n_tasks=None, local_tasks=None, comm=None):
+def memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, n_tasks=None, local_tasks=None, comm=None,
+                                 t3=None, input_t3_ijk_memory=0):
     rank = getattr(mycc, 'rank', 0)
     if comm is not None:
         rank = comm.Get_rank()
-    if rank != 0:
-        return mycc
 
     log = logger.Logger(mycc.stdout, mycc.verbose)
     itemsize = np.dtype(np.float64).itemsize
@@ -116,12 +108,29 @@ def memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, n_tasks=None, local_
     def mem(nelem):
         return float(nelem) * itemsize
 
+    current_memory_mb = lib.current_memory()[0]
+    current_memory = int(current_memory_mb * 1024**2)
+    available_memory_mb = mycc.max_memory - current_memory_mb
+    available_memory = int(available_memory_mb * 1024**2)
+
+    t3_abc_memory = _t3_local_nbytes(t3) if _is_abc_distributed_t3(t3) else 0
+    input_t3_ijk_memory = int(input_t3_ijk_memory)
+
+    if comm is not None:
+        current_memory = int(comm.allreduce(current_memory, op=MPI.MAX))
+        available_memory = int(comm.allreduce(available_memory, op=MPI.MIN))
+        t3_abc_memory = int(comm.allreduce(t3_abc_memory, op=MPI.MAX))
+        input_t3_ijk_memory = int(comm.allreduce(input_t3_ijk_memory, op=MPI.MAX))
+
+    if rank != 0:
+        return mycc
+
     t4_block_memory = mem(blksize**4 * nocc**4)
     t3_block_memory = mem(6 * blksize**2 * nvir * nocc**3)
     factor_memory = mem(blksize**4)
     ptr_table_memory = 0.0
     try:
-        ptr_table_memory = float(mycc.tamps[2][0].n_abc_triplets) * np.dtype(np.uint64).itemsize
+        ptr_table_memory = float(t3[0].n_abc_triplets) * np.dtype(np.uint64).itemsize
     except Exception:
         pass
 
@@ -132,23 +141,35 @@ def memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, n_tasks=None, local_
 
     w_memory = mem(12 * blksize**3 * nvir * nocc**2 + 6 * blksize**2 * nocc**4)
     runtime_peak = 2 * t4_block_memory + t3_block_memory + factor_memory + ptr_table_memory
-    total_memory = eris_memory + prefetch_memory + w_memory + runtime_peak
+    resident_memory = eris_memory + t3_abc_memory + input_t3_ijk_memory
+    additional_memory = prefetch_memory + w_memory + runtime_peak
+    total_memory = resident_memory + additional_memory
+    projected_peak_memory = current_memory + additional_memory
 
     log.info('RCCSDT(Q) approximate per-rank memory usage estimate')
     log.info('    MPI ranks              %8d', size)
     if n_tasks is not None:
         log.info('    ABCD tasks total/local %8s', '%d/%d' % (n_tasks, local_tasks))
-    log.info('    ERI copies             %8s', format_size(eris_memory))
+    log.info('    Current max-rank RSS   %8s', format_size(current_memory))
+    log.info('    T3 ABC resident        %8s', format_size(t3_abc_memory))
+    if input_t3_ijk_memory:
+        log.info('    T3 IJK input resident  %8s', format_size(input_t3_ijk_memory))
+    log.info('    ERI copies resident    %8s', format_size(eris_memory))
     log.info('    T4/Z4 work blocks      %8s', format_size(2 * t4_block_memory))
     log.info('    T3 staging blocks      %8s', format_size(t3_block_memory))
     log.info('    T3 prefetch buffers    %8s', format_size(prefetch_memory))
     log.info('    W intermediates peak   %8s', format_size(w_memory))
     log.info('    Factor/pointer tables  %8s', format_size(factor_memory + ptr_table_memory))
-    log.info('Total estimated per-rank   %8s', format_size(total_memory))
+    log.info('Modeled resident subtotal  %8s', format_size(resident_memory))
+    log.info('Additional workspace est.  %8s', format_size(additional_memory))
+    log.info('Total modeled memory       %8s', format_size(total_memory))
+    log.info('Projected max-rank peak    %8s', format_size(projected_peak_memory))
 
-    max_memory = mycc.max_memory - lib.current_memory()[0]
-    if (total_memory / 1024**2) > max_memory:
-        logger.warn(mycc, 'Estimated per-rank memory %.2f MB exceeds available %.2f MB', total_memory / 1024**2, max_memory)
+    if additional_memory > available_memory:
+        logger.warn(mycc, 'Estimated additional RCCSDT(Q) workspace %s exceeds available %s '
+                    '(projected peak %s vs max_memory %s)',
+                    format_size(additional_memory), format_size(available_memory),
+                    format_size(projected_peak_memory), format_size(mycc.max_memory * 1024**2))
     return mycc
 
 
@@ -165,7 +186,7 @@ def _dump_flag_group(log, title, pairs):
 
 
 def dump_flags(mycc, blksize=4, comm=None, job_idx=0, n_jobs=1,
-               release_ijk_t3=False, log_redistribution=False, verbose=None):
+               log_redistribution=False, verbose=None):
     '''Print RCCSDT(Q)-specific startup options.'''
     if getattr(mycc, 'rank', 0) != 0:
         return mycc
@@ -179,7 +200,6 @@ def dump_flags(mycc, blksize=4, comm=None, job_idx=0, n_jobs=1,
         ('blksize', blksize),
         ('job_idx', job_idx),
         ('n_jobs', n_jobs),
-        ('release_ijk_t3', release_ijk_t3),
         ('log_redistribution', log_redistribution),
         ('einsum_backend', getattr(mycc, 'einsum_backend', None)),
         ('allow_python_fallback', getattr(mycc, 'allow_python_fallback', None)),
@@ -204,7 +224,7 @@ def dump_flags(mycc, blksize=4, comm=None, job_idx=0, n_jobs=1,
     return mycc
 
 
-def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=1, release_ijk_t3=False, log_redistribution=False):
+def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=1, log_redistribution=False):
     '''Compute [Q] and (Q) correction terms using the ABC-based algorithm.
     Offsets and tasks are determined by job_idx/n_jobs for job splitting.'''
     time0 = logger.process_clock(), logger.perf_counter()
@@ -220,7 +240,7 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     log = logger.Logger(mycc.stdout, mycc.verbose if rank == 0 else 0)
     if rank == 0 and mycc.verbose >= logger.WARN:
         dump_flags(mycc, blksize=blksize, comm=comm, job_idx=job_idx, n_jobs=n_jobs,
-                   release_ijk_t3=release_ijk_t3, log_redistribution=log_redistribution)
+                   log_redistribution=log_redistribution)
 
     if eris is None:
         eris = mycc.ao2mo(mycc.mo_coeff)
@@ -242,9 +262,20 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     nvir = nmo - nocc
 
     log_memory(mycc, memlog, 'RCCSDT(Q) Before T_IJK -> T_ABC')
-    _, t2, t3 = prepare_tamps_for_q(mycc, tamps=tamps, blksize=blksize, comm=comm,
-                                    release_ijk_t3=release_ijk_t3,
-                                    log_redistribution=log_redistribution)
+    input_tamps = tamps if tamps is not None else getattr(mycc, 'tamps', None)
+    input_t3 = input_tamps[2] if input_tamps is not None and len(input_tamps) > 2 else None
+    input_t3_ijk_memory = 0
+    if input_t3 is not None and not _is_abc_distributed_t3(input_t3):
+        input_t3_ijk_memory = _t3_local_nbytes(input_t3)
+        if rank == 0:
+            logger.warn(mycc, 'RCCSDT(Q) received IJK-distributed T3 and will build ABC-distributed T3; '
+                        'assume both layouts remain resident. For memory-constrained runs, call '
+                        'prepare_tamps_for_q manually, delete IJK references, then pass ABC T3 to kernel.')
+    prepared_tamps = prepare_tamps_for_q(
+        mycc, tamps=tamps, blksize=blksize, comm=comm,
+        log_redistribution=log_redistribution)
+    _, t2, t3 = prepared_tamps
+    prepared_tamps = None
     dt3, t3_local = t3
     log_memory(mycc, memlog, 'RCCSDT(Q) After T_IJK -> T_ABC')
 
@@ -352,7 +383,8 @@ def kernel(mycc, eris=None, tamps=None, blksize=4, comm=None, job_idx=0, n_jobs=
     my_tasks = my_job_tasks[my_start:my_end]
 
     detail_log.debug(f"  Rank {rank}: {len(my_tasks)} tasks")
-    memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, total_tasks, len(my_tasks), comm)
+    memory_estimate_log_rccsdt_q(mycc, nvir, nocc, blksize, total_tasks, len(my_tasks), comm,
+                                 t3=t3, input_t3_ijk_memory=input_t3_ijk_memory)
 
 
     def compute_W_vvvvoo(W_vvvvoo, a0, a1, b0, b1, c0, c1):
@@ -1204,7 +1236,7 @@ if __name__ == '__main__':
     q_paren = -0.001620887567
 
     mycc.verbose = 8
-    q_bracket, q_paren = kernel(mycc, tamps=tamps, blksize=8, comm=comm, job_idx=0, n_jobs=1, release_ijk_t3=False)
+    q_bracket, q_paren = kernel(mycc, tamps=tamps, blksize=8, comm=comm, job_idx=0, n_jobs=1)
     if rank == 0:
         print('SQ corr: % .12f    Ref: % .12f    Diff: % .12e'%(q_bracket, q_bracket, q_bracket - q_bracket))
         print('PQ corr: % .12f    Ref: % .12f    Diff: % .12e'%(q_paren, q_paren, q_paren - q_paren))

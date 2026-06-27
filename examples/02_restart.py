@@ -73,7 +73,7 @@ if rank == 0:
     print('RCCSDT correlation energy after restart % .12f' % cc2.e_corr)
     print('RCCSDT correlation energy reference     % .12f' % ref_ecorr)
 
-q_bracket, q_paren = rccsdt_q.kernel(cc2, comm=comm, blksize=8, release_ijk_t3=False, log_redistribution=False)
+q_bracket, q_paren = rccsdt_q.kernel(cc2, comm=comm, blksize=8, log_redistribution=False)
 
 ref_q_bracket, ref_q_paren = -0.000440859544, -0.000488539476
 if rank == 0:

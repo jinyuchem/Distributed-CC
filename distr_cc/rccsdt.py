@@ -806,10 +806,13 @@ def memory_estimate_log_mpi_rccsdt(mycc):
     update_peak_memory = update_work_peak_memory + diis_resident_memory
     diis_peak_memory = local_t3_memory + eris_memory + diis_memory
     total_memory = max(update_peak_memory, diis_peak_memory)
+    current_memory = int(lib.current_memory()[0] * 1024**2)
+    projected_peak_memory = current_memory + total_memory
 
     fmt = format_size
     log.info('')
     log.info('Approximate per-rank memory usage estimate')
+    log.info('    Current rank-0 memory   %8s', fmt(current_memory))
     log.info('    Local T3 memory (max)   %8s', fmt(local_t3_memory))
     log.info('    Local R3 memory (max)   %8s', fmt(local_r3_memory))
     log.info('    Global T3 footprint     %8s', fmt(global_t3_footprint))
@@ -836,13 +839,16 @@ def memory_estimate_log_mpi_rccsdt(mycc):
     log.info('Update estimated peak       %8s', fmt(update_peak_memory))
     if mycc.diis:
         log.info('DIIS estimated peak         %8s', fmt(diis_peak_memory))
-    log.info('Total estimated per-rank    %8s', fmt(total_memory))
+    log.info('Additional estimated memory %8s', fmt(total_memory))
+    log.info('Projected rank-0 peak       %8s', fmt(projected_peak_memory))
     log.info('')
 
     max_memory = mycc.max_memory - lib.current_memory()[0]
     if (total_memory / 1024**2) > max_memory:
-        logger.warn(mycc, 'Estimated per-rank memory %.2f MB exceeds available %.2f MB',
-                    total_memory / 1024**2, max_memory)
+        logger.warn(mycc, 'Estimated additional per-rank memory %s exceeds available %s '
+                    '(projected peak %s vs max_memory %s)',
+                    fmt(total_memory), fmt(max_memory * 1024**2),
+                    fmt(projected_peak_memory), fmt(mycc.max_memory * 1024**2))
     return mycc
 
 def update_amps_rccsdt_tri_(mycc, tamps, eris):

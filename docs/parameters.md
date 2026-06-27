@@ -58,7 +58,6 @@ q_bracket, q_paren = rccsdt_q.kernel(
     blksize=8,
     job_idx=0,
     n_jobs=1,
-    release_ijk_t3=False,
     log_redistribution=False,
 )
 ```
@@ -70,10 +69,14 @@ Important arguments:
 - `job_idx`, `n_jobs`: split the full perturbative task list across independent
   jobs. `job_idx` is 0-based. The split depends on `blksize`, so use the same
   `blksize` for all jobs in one split run.
-- `release_ijk_t3`: replace the original IJK-distributed T3 amplitudes with
-  ABC-distributed T3 amplitudes after redistribution to reduce memory.
 - `log_redistribution`: print T3 redistribution information during the
   IJK-to-ABC transform.
+
+When `kernel` receives IJK-distributed T3 amplitudes, it builds an
+ABC-distributed T3 copy internally. Memory-constrained runs should assume both
+IJK and ABC T3 layouts may remain resident. To control object lifetime
+explicitly, call `rccsdt_q.prepare_tamps_for_q`, delete every reference to the
+IJK T3 amplitudes, and then pass the prepared ABC amplitudes to `kernel`.
 
 `RCCSDT(Q)` reads the diagnostic flags from the `RCCSDT` object. In particular,
 `log_highest_t_communication=True` writes per-rank communication CSV files, and

@@ -395,9 +395,12 @@ def memory_estimate_log_mpi_rccsdtq(mycc):
     update_peak_memory = update_work_peak_memory + diis_resident_memory
     diis_peak_memory = local_t4_memory + eris_memory + diis_memory
     total_memory = max(update_peak_memory, diis_peak_memory)
+    current_memory = int(lib.current_memory()[0] * 1024**2)
+    projected_peak_memory = current_memory + total_memory
 
     fmt = rccsdt.format_size
     log.info('Approximate per-rank memory usage estimate')
+    log.info('    Current rank-0 memory   %8s', fmt(current_memory))
     log.info('    Local T4 memory (max)   %8s', fmt(local_t4_memory))
     log.info('    Local R4 memory (max)   %8s', fmt(local_r4_memory))
     log.info('    Global T4 footprint     %8s', fmt(global_t4_footprint))
@@ -427,13 +430,16 @@ def memory_estimate_log_mpi_rccsdtq(mycc):
     log.info('Update estimated peak       %8s', fmt(update_peak_memory))
     if mycc.diis:
         log.info('DIIS estimated peak         %8s', fmt(diis_peak_memory))
-    log.info('Total estimated per-rank    %8s', fmt(total_memory))
+    log.info('Additional estimated memory %8s', fmt(total_memory))
+    log.info('Projected rank-0 peak       %8s', fmt(projected_peak_memory))
     log.info('Rank-0 T4 balance setup     %8s transient', fmt(distribution_setup_memory))
 
     max_memory = mycc.max_memory - lib.current_memory()[0]
     if (total_memory / 1024**2) > max_memory:
-        logger.warn(mycc, 'Estimated per-rank memory %.2f MB exceeds available %.2f MB',
-                    total_memory / 1024**2, max_memory)
+        logger.warn(mycc, 'Estimated additional per-rank memory %s exceeds available %s '
+                    '(projected peak %s vs max_memory %s)',
+                    fmt(total_memory), fmt(max_memory * 1024**2),
+                    fmt(projected_peak_memory), fmt(mycc.max_memory * 1024**2))
     return mycc
 
 def r2_add_t4_tri_(mycc, imds, r2, t4):
