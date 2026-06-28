@@ -101,6 +101,14 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
         self.assertAlmostEqual(e_q_paren, EXPECTED_PAREN_Q_ENERGY, 10)
 
+    def test_t3ijk_abc_transformation(self):
+        mcc2 = rccsdt.RCCSDT(rhf, comm=MPI.COMM_WORLD)
+        tamps = mcc.tamps
+        tamps_q = rccsdt_q.prepare_tamps_for_q(mcc2, tamps=tamps, blksize=5, comm=MPI.COMM_WORLD)
+        e_q_bracket, e_q_paren = rccsdt_q.kernel(mcc2, tamps=tamps_q, blksize=5)
+        self.assertAlmostEqual(e_q_bracket, EXPECTED_BRACKET_Q_ENERGY, 10)
+        self.assertAlmostEqual(e_q_paren, EXPECTED_PAREN_Q_ENERGY, 10)
+
 
 if __name__ == "__main__":
     print("Full Tests for rccsdt_q")
