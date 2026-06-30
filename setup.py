@@ -31,7 +31,7 @@ setup(
     author_email="yjin@flatironinstitute.org",
     license="Apache-2.0",
     url="https://github.com/jinyuchem/Distributed-CC",
-    packages=["Distributed-CC"],
+    packages=["distr_cc"],
     python_requires=">=3.9",
     install_requires=["numpy", "pyscf>=2.13.1", "mpi4py"],
 )

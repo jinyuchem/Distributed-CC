@@ -23,6 +23,7 @@ distr_cc/      Python package
 src/           C helper kernels built by CMake
 tests/         pytest tests
 examples/      runnable examples
+doc/           documentation
 ```
 
 ## Requirements
@@ -33,48 +34,67 @@ Distributed-CC requires:
 - MPI and `mpi4py`
 - CMake and a C/C++ compiler
 - NumPy
-- PySCF with `pyscf.cc.rccsdt` and related high-order coupled-cluster helpers
+- PySCF 2.13.1 or newer
 
-The package metadata currently pins PySCF to version 2.13.1. The native helper
-library is required by default and must be built before running the distributed
-methods.
+The native helper library is required and must be built before running the distributed methods.
 
 [`pytblis`](https://github.com/chillenb/pytblis) is optional but strongly recommended for production calculations,
-especially on Linux HPC systems. It can substantially improve tensor
-contraction performance.
+especially on Linux HPC systems. It can substantially improve tensor contraction performance.
 
 ## Installation
 
-Create and activate a virtual environment, then install the package in editable mode:
+Distributed-CC uses native C helper kernels. Build the native library before installing or importing the Python package.
 
-```bash
-python -m pip install -e .
-```
+### Recommended editable install
 
-## Native Build
-
-Build the native helper library with CMake:
+From the repository root, compile the C code first:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-By default, CMake writes one shared object to:
+<!-- By default, CMake writes one shared object to:
 
 ```text
 build/distr_cc.so
+``` -->
+
+<!-- `distr_cc._lib` loads this file directly. If the library is missing, importing -->
+<!-- or running the native-backed code should fail rather than silently selecting a different build. -->
+
+Then install the Python package in editable mode:
+
+```bash
+python -m pip install -e .
 ```
 
-`distr_cc._lib` loads this file directly. If the library is missing, importing
-or running the native-backed code should fail rather than silently selecting a different build.
+### Manual path-based use
+
+For development or local testing, you may skip `pip install -e .` if all Python dependencies are already installed in the active environment.
+
+```python
+import sys
+
+sys.path.insert(0, "/absolute/path/to/Distributed-CC")
+
+from distr_cc import RCCSDT, RCCSDTQ
+from distr_cc import rccsdt_q
+```
+
+or with `PYTHONPATH`:
+
+```bash
+export PYTHONPATH=/absolute/path/to/Distributed-CC:$PYTHONPATH
+mpirun -n 4 python examples/00_rccsdt_q_water.py
+```
+
+### Native build options
 
 The default native build uses portable optimization flags. Native CPU tuning and OpenMP are opt-in:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DDISTR_CC_NATIVE=ON \
-  -DDISTR_CC_OPENMP=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDISTR_CC_NATIVE=ON -DDISTR_CC_OPENMP=ON
 cmake --build build --parallel
 ```
 
@@ -119,8 +139,7 @@ if comm.rank == 0:
     print("RCCSDTQ correlation energy:", myccq.e_corr)
 ```
 
-For recommended performance settings after installing `pytblis`, set the
-einsum backend before running the kernel:
+For recommended performance settings after installing `pytblis`, set the einsum backend before running the kernel:
 
 ```python
 mycc.set_einsum_backend("pytblis")
