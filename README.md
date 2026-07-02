@@ -13,7 +13,7 @@ The code is developed at the Initiative for Computational Catalysis at the Flati
 
 If you find this package useful for your scientific research, please cite the work as:
 
- - Y. Jin, C. Hillenbrand, T. C. Berkelbach, and H. Zhai. High-performance parallel implementation of high-order coupled-cluster theories. *TBD*.
+ - Y. Jin, C. Hillenbrand, T. C. Berkelbach, and H. Zhai. "High-performance parallel implementation of high-order coupled-cluster theories." arXiv: [10.48550/arXiv.2607.00981](https://arxiv.org/abs/2607.00981).
 
 
 ## Repository Layout
@@ -53,15 +53,6 @@ From the repository root, compile the C code first:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
-
-<!-- By default, CMake writes one shared object to:
-
-```text
-build/distr_cc.so
-``` -->
-
-<!-- `distr_cc._lib` loads this file directly. If the library is missing, importing -->
-<!-- or running the native-backed code should fail rather than silently selecting a different build. -->
 
 Then install the Python package in editable mode:
 
