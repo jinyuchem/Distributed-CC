@@ -104,6 +104,15 @@ def _allreduce_inplace_mpi_rccsdt(mycc, buf, label, op=MPI.SUM):
     return _allreduce_inplace_large(mycc.comm, buf, op=op, log=log, label=label, log_timing=log_timing)
 
 
+def _clear_prefetch_buffers(distributed_obj):
+    if hasattr(distributed_obj, 'recv_buffers'):
+        distributed_obj.recv_buffers = [None, None]
+    if hasattr(distributed_obj, 'send_buffers'):
+        distributed_obj.send_buffers = [None, None]
+    if hasattr(distributed_obj, 'buffer_idx'):
+        distributed_obj.buffer_idx = 0
+
+
 def configure_t3_runtime_logging(mycc, tamps):
     if tamps is None or len(tamps) < 3:
         return
@@ -466,6 +475,8 @@ def compute_oooo_oovv_contraction_(mycc, imds, t3, r3_local):
 
     n_batches = len(batches)
     handle = None
+    t3_data = None
+    batch_ijk_reordered = None
 
     progress_thread = start_mpi_progress_thread(mycc) if n_batches > 0 else None
     try:
@@ -593,9 +604,13 @@ def compute_oooo_oovv_contraction_(mycc, imds, t3, r3_local):
         if progress_thread is not None:
             progress_thread.stop()
 
+    t3_data = None
+    batch_ijk_reordered = None
+    _clear_prefetch_buffers(dt3)
     W_ovov = imds.W_ovov = None
     W_ovvo = imds.W_ovvo = None
     t3_tmp = t3_tmp_2 = t3_tmp_p3_v0 = t3_tmp_p3_v1 = t3_tmp_p3_v2 = None
+    log_memory(mycc, memlog, 'OO T3 buffers released')
     return r3_local
 
 def compute_r3_Foo_Woooo_contribution_batch_(mycc, r3_local, dt3, t3_data, batch_ijk, imds):
@@ -765,16 +780,20 @@ def memory_estimate_log_mpi_rccsdt(mycc):
         t3_batch_collect_memory = batch * t3_block_memory
     t3_batch_memory = t3_batch_recv_memory + t3_batch_send_memory + t3_batch_collect_memory
 
-    eris_memory = nmo**4 * itemsize
-    eris_runtime_memory = 3 * eris_memory
     r1_memory = nocc * nvir * itemsize
     r2_memory = nocc**2 * nvir**2 * itemsize
+    lower_tamps_memory = r1_memory + r2_memory
+    resident_tamps_memory = lower_tamps_memory + local_t3_memory
+
+    eris_memory = nmo**4 * itemsize
+    eris_runtime_memory = 3 * eris_memory
     w_oooo_memory = nocc**4 * itemsize
     w_ovov_memory = nocc**2 * nvir**2 * itemsize
     t3_temp_memory = 5 * t3_block_memory
-    t3_work_memory = max(local_r3_memory + t3_temp_memory,
-                         local_r3_memory + w_oooo_memory + w_ovov_memory + t3_batch_memory)
-    intermediates_work_memory = max(r1_memory + r2_memory, t3_work_memory)
+    t3_prefactor_memory = 6 * batch * local_max * itemsize
+    t3_non_allgatherv_work_memory = max(r1_memory + r2_memory, t3_temp_memory)
+    t3_allgatherv_work_memory = w_oooo_memory + w_ovov_memory + t3_batch_memory + t3_prefactor_memory
+    intermediates_work_memory = max(t3_non_allgatherv_work_memory, t3_allgatherv_work_memory)
 
     diis_scratch = resolve_diis_scratch(mycc)
     diis_incore_space = resolve_diis_incore_space(mycc)
@@ -800,11 +819,21 @@ def memory_estimate_log_mpi_rccsdt(mycc):
     elif mycc.diis and mycc.incore_complete:
         nocc2_unique = nocc * (nocc + 1) // 2
         diis_vector_memory = (nocc * nvir + nocc2_unique * nvir**2) * itemsize
-        diis_memory = diis_vector_memory * mycc.diis_space * 2
+        diis_history_memory = diis_vector_memory * mycc.diis_space * 2
+        diis_xprev_memory = diis_vector_memory
+        diis_resident_memory = diis_history_memory + diis_xprev_memory
+        diis_live_memory = 4 * diis_vector_memory
+        diis_memory = diis_resident_memory + diis_live_memory
 
-    update_work_peak_memory = local_t3_memory + local_r3_memory + eris_runtime_memory + intermediates_work_memory
+    non_allgatherv_work_peak_memory = (resident_tamps_memory + local_r3_memory +
+                                       eris_runtime_memory + t3_non_allgatherv_work_memory)
+    allgatherv_work_peak_memory = (resident_tamps_memory + eris_runtime_memory +
+                                   t3_allgatherv_work_memory)
+    update_work_peak_memory = max(non_allgatherv_work_peak_memory, allgatherv_work_peak_memory)
+    non_allgatherv_peak_memory = non_allgatherv_work_peak_memory + diis_resident_memory
+    allgatherv_peak_memory = allgatherv_work_peak_memory + diis_resident_memory
     update_peak_memory = update_work_peak_memory + diis_resident_memory
-    diis_peak_memory = local_t3_memory + eris_memory + diis_memory
+    diis_peak_memory = resident_tamps_memory + eris_memory + diis_memory
     total_memory = max(update_peak_memory, diis_peak_memory)
     current_memory = int(lib.current_memory()[0] * 1024**2)
     projected_peak_memory = current_memory + total_memory
@@ -815,6 +844,7 @@ def memory_estimate_log_mpi_rccsdt(mycc):
     log.info('    Current rank-0 memory   %8s', fmt(current_memory))
     log.info('    Local T3 memory (max)   %8s', fmt(local_t3_memory))
     log.info('    Local R3 memory (max)   %8s', fmt(local_r3_memory))
+    log.info('    Lower T amplitudes      %8s', fmt(lower_tamps_memory))
     log.info('    Global T3 footprint     %8s', fmt(global_t3_footprint))
     log.info('    T3 prefetch recv bufs   %8s', fmt(t3_batch_recv_memory))
     log.info('    T3 prefetch send bufs   %8s', fmt(t3_batch_send_memory))
@@ -822,20 +852,26 @@ def memory_estimate_log_mpi_rccsdt(mycc):
         log.info('    T3 prefetch slots       %8d', prefetch_slots)
     if t3_batch_collect_memory:
         log.info('    T3 local batch data     %8s', fmt(t3_batch_collect_memory))
+    log.info('    OO prefactor buffer     %8s', fmt(t3_prefactor_memory))
     log.info('    T3 temp buffers         %8s', fmt(t3_temp_memory))
     log.info('    ERIs memory             %8s', fmt(eris_memory))
     log.info('    Intermediates/work peak %8s', fmt(intermediates_work_memory))
     log.info('    DIIS memory             %8s', fmt(diis_memory))
-    if mycc.do_diis_max_t and mycc.diis:
+    if mycc.diis and diis_vector_memory:
         log.info('    DIIS resident memory    %8s', fmt(diis_resident_memory))
         log.info('    DIIS transient memory   %8s', fmt(diis_live_memory))
-        log.info('    nvir_diis         %8d of %d', nvir_t3_diis, nvir)
         log.info('    DIIS vector size        %8s', fmt(diis_vector_memory))
+    if mycc.do_diis_max_t and mycc.diis:
+        log.info('    nvir_diis         %8d of %d', nvir_t3_diis, nvir)
     if mycc.do_diis_max_t and mycc.diis and diis_scratch is not None:
         log.info('    DIIS in-core slots      %8d of %d', diis_incore_space, mycc.diis_space)
         log.info('    DIIS scratch footprint  %8s', fmt(diis_scratch_memory))
         log.info('    DIIS scratch dir        %s', diis_scratch)
+    log.info('Non-allgatherv work peak    %8s', fmt(non_allgatherv_work_peak_memory))
+    log.info('OO/allgatherv work peak     %8s', fmt(allgatherv_work_peak_memory))
     log.info('Update work peak            %8s', fmt(update_work_peak_memory))
+    log.info('Non-allgatherv est. peak    %8s', fmt(non_allgatherv_peak_memory))
+    log.info('OO/allgatherv est. peak     %8s', fmt(allgatherv_peak_memory))
     log.info('Update estimated peak       %8s', fmt(update_peak_memory))
     if mycc.diis:
         log.info('DIIS estimated peak         %8s', fmt(diis_peak_memory))

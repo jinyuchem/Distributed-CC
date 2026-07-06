@@ -41,7 +41,7 @@ if __package__ in (None, ""):
 
 from distr_cc import _rccsdtq_core as rccsdtq
 from distr_cc._rccsdtq_core import t4_project_1_minus_p4_p31_inplace_, t4_add_, _IMDS
-from distr_cc.rccsdt import _update_procs_mf, RCCSDT
+from distr_cc.rccsdt import _clear_prefetch_buffers, _update_procs_mf, RCCSDT
 from distr_cc._c_rccsdtq import (r4_local_tri_divide_e_, t4_single_spin_summation_inplace_,
                                 t4_spin_summation_quadruple_sym_, t4_transpose_add_,)
 from distr_cc._mpi import punctuate_mpi_progress, start_mpi_progress_thread
@@ -338,7 +338,13 @@ def memory_estimate_log_mpi_rccsdtq(mycc):
     eris_memory = nmo**4 * itemsize
     eris_runtime_memory = 3 * eris_memory
     nocc_pair = nocc * (nocc + 1) // 2
-    r2_loc_memory = nocc**2 * nvir**2 * itemsize
+    t1_memory = nocc * nvir * itemsize
+    t2_memory = nocc**2 * nvir**2 * itemsize
+    t3_memory = nocc**3 * nvir**3 * itemsize
+    lower_tamps_memory = t1_memory + t2_memory + t3_memory
+    resident_tamps_memory = lower_tamps_memory + local_t4_memory
+
+    r2_loc_memory = t2_memory
     r3_loc_memory = nocc**3 * nvir**3 * itemsize
     w_oovvvo_memory = nocc**3 * nvir**3 * itemsize
     w_ovovvo_memory = nocc**3 * nvir**3 * itemsize
@@ -357,9 +363,11 @@ def memory_estimate_log_mpi_rccsdtq(mycc):
     r4_oooovv_oovvvv_work_memory = max(w_oooovv_memory + w_oovvvv_memory,
                     w_oooovv_memory + w_oovvvv_memory + t4_block_memory,
                     w_oooovv_memory + w_oovvvv_memory + tmp_ovvo_memory)
-    r4_oo_work_memory = (w_voov_memory + t4_batch_memory + prefactor_memory + t4_oo_temp_memory)
-    intermediates_work_memory = max(r2_t4_work_memory, r3_t4_work_memory, r4_oovvvo_work_memory, r4_ovovvo_work_memory,
-                                    r4_oooovv_oovvvv_work_memory, t4_block_memory, r4_oo_work_memory,)
+    r4_oo_work_memory = w_voov_memory + t4_batch_memory + prefactor_memory + t4_oo_temp_memory
+    non_allgatherv_intermediates_memory = max(r2_t4_work_memory, r3_t4_work_memory,
+                                              r4_oovvvo_work_memory, r4_ovovvo_work_memory,
+                                              r4_oooovv_oovvvv_work_memory, t4_block_memory)
+    intermediates_work_memory = max(non_allgatherv_intermediates_memory, r4_oo_work_memory)
 
     diis_scratch = resolve_diis_scratch(mycc)
     diis_incore_space = resolve_diis_incore_space(mycc)
@@ -389,11 +397,23 @@ def memory_estimate_log_mpi_rccsdtq(mycc):
         nocc2_unique = nocc * (nocc + 1) // 2
         nocc3_unique = nocc * (nocc + 1) * (nocc + 2) // 6
         diis_vector_memory = (nocc * nvir + nocc2_unique * nvir**2 + nocc3_unique * nvir**3) * itemsize
-        diis_memory = diis_vector_memory * mycc.diis_space * 2
+        diis_history_memory = diis_vector_memory * mycc.diis_space * 2
+        diis_xprev_memory = diis_vector_memory
+        diis_resident_memory = diis_history_memory + diis_xprev_memory
+        # Standard DIIS keeps the lower-amplitude history resident in core and
+        # transiently materializes packed/extrapolated lower-amplitude vectors.
+        diis_live_memory = 4 * diis_vector_memory
+        diis_memory = diis_resident_memory + diis_live_memory
 
-    update_work_peak_memory = local_t4_memory + local_r4_memory + eris_runtime_memory + intermediates_work_memory
+    non_allgatherv_work_peak_memory = (resident_tamps_memory + local_r4_memory +
+                                       eris_runtime_memory + non_allgatherv_intermediates_memory)
+    allgatherv_work_peak_memory = (resident_tamps_memory + local_r4_memory +
+                                   eris_runtime_memory + r4_oo_work_memory)
+    update_work_peak_memory = max(non_allgatherv_work_peak_memory, allgatherv_work_peak_memory)
+    non_allgatherv_peak_memory = non_allgatherv_work_peak_memory + diis_resident_memory
+    allgatherv_peak_memory = allgatherv_work_peak_memory + diis_resident_memory
     update_peak_memory = update_work_peak_memory + diis_resident_memory
-    diis_peak_memory = local_t4_memory + eris_memory + diis_memory
+    diis_peak_memory = resident_tamps_memory + eris_memory + diis_memory
     total_memory = max(update_peak_memory, diis_peak_memory)
     current_memory = int(lib.current_memory()[0] * 1024**2)
     projected_peak_memory = current_memory + total_memory
@@ -403,6 +423,7 @@ def memory_estimate_log_mpi_rccsdtq(mycc):
     log.info('    Current rank-0 memory   %8s', fmt(current_memory))
     log.info('    Local T4 memory (max)   %8s', fmt(local_t4_memory))
     log.info('    Local R4 memory (max)   %8s', fmt(local_r4_memory))
+    log.info('    Lower T amplitudes      %8s', fmt(lower_tamps_memory))
     log.info('    Global T4 footprint     %8s', fmt(global_t4_footprint))
     log.info('    T4 prefetch recv bufs   %8s', fmt(t4_batch_recv_memory))
     log.info('    T4 prefetch send bufs   %8s', fmt(t4_batch_send_memory))
@@ -417,16 +438,21 @@ def memory_estimate_log_mpi_rccsdtq(mycc):
     log.info('    ERIs work buffer        %8s', fmt(eris_memory))
     log.info('    Intermediates/work peak %8s', fmt(intermediates_work_memory))
     log.info('    DIIS memory             %8s', fmt(diis_memory))
-    if mycc.do_diis_max_t and mycc.diis:
+    if mycc.diis and diis_vector_memory:
         log.info('    DIIS resident memory    %8s', fmt(diis_resident_memory))
         log.info('    DIIS transient memory   %8s', fmt(diis_live_memory))
-        log.info('   nvir_diis          %8d of %d', nvir_t4_diis, nvir)
         log.info('    DIIS vector size        %8s', fmt(diis_vector_memory))
+    if mycc.do_diis_max_t and mycc.diis:
+        log.info('   nvir_diis          %8d of %d', nvir_t4_diis, nvir)
     if mycc.do_diis_max_t and mycc.diis and diis_scratch is not None:
         log.info('    DIIS in-core slots      %8d of %d', diis_incore_space, mycc.diis_space)
         log.info('    DIIS scratch footprint  %8s', fmt(diis_scratch_memory))
         log.info('    DIIS scratch dir        %s', diis_scratch)
+    log.info('Non-allgatherv work peak    %8s', fmt(non_allgatherv_work_peak_memory))
+    log.info('OO/allgatherv work peak     %8s', fmt(allgatherv_work_peak_memory))
     log.info('Update work peak            %8s', fmt(update_work_peak_memory))
+    log.info('Non-allgatherv est. peak    %8s', fmt(non_allgatherv_peak_memory))
+    log.info('OO/allgatherv est. peak     %8s', fmt(allgatherv_peak_memory))
     log.info('Update estimated peak       %8s', fmt(update_peak_memory))
     if mycc.diis:
         log.info('DIIS estimated peak         %8s', fmt(diis_peak_memory))
@@ -1312,6 +1338,7 @@ def compute_oooo_oovv_contraction_(mycc, imds, t4, r4_local):
     batch_ijkl_reordered = None
     t4_tmp, t4_tmp_p3_v0, t4_tmp_p3_v1, t4_tmp_p3_v2, t4_tmp_p3_v3, t4_tmp_3 = None, None, None, None, None, None
     r4_tmp = None
+    _clear_prefetch_buffers(dt4)
 
     ijkl_list = None
     local_ijkl = None
